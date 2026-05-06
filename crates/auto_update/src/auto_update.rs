@@ -48,6 +48,66 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
 
+fn enhanced_remote_server_required() -> bool {
+    env::var("ZED_ENHANCED_REMOTE_SERVER_REQUIRED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "required"
+        )
+    })
+}
+
+fn bundled_remote_server_release_path(os: &str, arch: &str) -> Option<PathBuf> {
+    for dir in bundled_remote_server_search_dirs() {
+        for name in bundled_remote_server_asset_names(os, arch) {
+            let path = dir.join(&name);
+            if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn bundled_remote_server_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(dir) = env::var("ZED_ENHANCED_REMOTE_SERVER_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
+
+    if let Ok(exe) = env::current_exe()
+        && let Some(macos_dir) = exe.parent()
+        && let Some(contents_dir) = macos_dir.parent()
+    {
+        dirs.push(contents_dir.join("Resources").join("remote_servers"));
+    }
+
+    dirs.push(paths::data_dir().join("remote_servers").join("bundled"));
+    dirs
+}
+
+fn bundled_remote_server_asset_names(os: &str, arch: &str) -> Vec<String> {
+    let extension = if os == "windows" { "zip" } else { "gz" };
+    if os == "linux" {
+        let preferred_libc = env::var("ZED_ENHANCED_REMOTE_SERVER_LIBC")
+            .unwrap_or_else(|_| "musl".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        let (first, second) = if preferred_libc == "gnu" {
+            ("gnu", "musl")
+        } else {
+            ("musl", "gnu")
+        };
+        vec![
+            format!("zed-remote-server-{os}-{arch}-{first}.{extension}"),
+            format!("zed-remote-server-{os}-{arch}.{extension}"),
+            format!("zed-remote-server-{os}-{arch}-{second}.{extension}"),
+        ]
+    } else {
+        vec![format!("zed-remote-server-{os}-{arch}.{extension}")]
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
     let os_release = match std::fs::read_to_string("/etc/os-release") {
@@ -597,6 +657,19 @@ impl AutoUpdater {
         set_status: impl Fn(&str, &mut AsyncApp) + Send + 'static,
         cx: &mut AsyncApp,
     ) -> Result<PathBuf> {
+        if let Some(path) = bundled_remote_server_release_path(os, arch) {
+            set_status("Using bundled enhanced remote server", cx);
+            log::info!(
+                "using bundled enhanced zed-remote-server for {os} {arch}: {}",
+                path.display()
+            );
+            return Ok(path);
+        } else if enhanced_remote_server_required() {
+            anyhow::bail!(
+                "enhanced remote server asset is required but was not found for {os} {arch}"
+            );
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
@@ -653,6 +726,12 @@ impl AutoUpdater {
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<Option<String>> {
+        if bundled_remote_server_release_path(os, arch).is_some()
+            || enhanced_remote_server_required()
+        {
+            return Ok(None);
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0

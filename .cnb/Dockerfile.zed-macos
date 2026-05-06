@@ -1,0 +1,179 @@
+FROM ghcr.io/rust-cross/cargo-zigbuild:latest
+
+ARG MACOS_SDK_VERSION=15.5
+ARG MACOS_SDK_SHA256=c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
+
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_INCREMENTAL=0
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/var/cache/sccache
+ENV SCCACHE_CACHE_SIZE=80G
+ENV SDKROOT=/opt/MacOSX${MACOS_SDK_VERSION}.sdk
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      clang \
+      cmake \
+      curl \
+      file \
+      git \
+      jq \
+      libclang-dev \
+      libprotobuf-dev \
+      libssl-dev \
+      lld \
+      mold \
+      nodejs \
+      npm \
+      pkg-config \
+      protobuf-compiler \
+      python3 \
+      sccache \
+      time \
+      xz-utils \
+      zip \
+      zstd; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy --component rust-src; \
+    rustup default 1.94.1; \
+    rustup target add \
+      wasm32-wasip2 \
+      wasm32-unknown-unknown \
+      x86_64-unknown-linux-musl \
+      aarch64-apple-darwin \
+      x86_64-apple-darwin; \
+    cargo zigbuild --help >/dev/null; \
+    zig version
+
+RUN set -eux; \
+    sdk_archive="/tmp/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"; \
+    curl -fsSL \
+      -o "$sdk_archive" \
+      "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"; \
+    printf '%s  %s\n' "$MACOS_SDK_SHA256" "$sdk_archive" | sha256sum -c -; \
+    rm -rf "$SDKROOT"; \
+    tar -xJf "$sdk_archive" -C /opt; \
+    rm -f "$sdk_archive"; \
+    test -d "$SDKROOT"; \
+    test -d "$SDKROOT/System/Library/Frameworks/ScreenCaptureKit.framework"; \
+    framework_dir="$SDKROOT/System/Library/Frameworks"; \
+    ln -sfn AppKit.framework "$framework_dir/Appkit.framework"; \
+    if [ -e "$framework_dir/AppKit.framework/AppKit.tbd" ] && [ ! -e "$framework_dir/AppKit.framework/Appkit.tbd" ]; then \
+      ln -s AppKit.tbd "$framework_dir/AppKit.framework/Appkit.tbd"; \
+    fi; \
+    if [ -e "$framework_dir/AppKit.framework/AppKit" ] && [ ! -e "$framework_dir/AppKit.framework/Appkit" ]; then \
+      ln -s AppKit "$framework_dir/AppKit.framework/Appkit"; \
+    fi; \
+    printf '!<arch>\n' > "$SDKROOT/usr/lib/libclang_rt.osx.a"; \
+    test -e "$SDKROOT/usr/lib/libclang_rt.osx.a"; \
+    test -e "$framework_dir/Appkit.framework/Appkit.tbd"; \
+    printf 'SDKROOT=%s\n' "$SDKROOT"
+
+RUN set -eux; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'if [ "$1" = "--sdk" ] && [ "$3" = "--show-sdk-path" ]; then' \
+      '  case "$2" in' \
+      '    macosx) test -n "${SDKROOT:-}" && printf "%s\n" "$SDKROOT" && exit 0 ;;' \
+      '  esac' \
+      'fi' \
+      'echo "unsupported xcrun shim invocation: $*" >&2' \
+      'exit 127' \
+      > /usr/local/bin/xcrun; \
+    chmod +x /usr/local/bin/xcrun
+
+RUN set -eux; \
+    cargo install cargo-about --version 0.8.2 --locked; \
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+
+RUN set -eux; \
+    real_zig="$(command -v zig)"; \
+    mv "$real_zig" "${real_zig}.real"; \
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      '' \
+      'script_path="$0"' \
+      'case "$script_path" in' \
+      '  /*) ;;' \
+      '  *) script_path="$(command -v -- "$script_path")" ;;' \
+      'esac' \
+      'real_zig="${script_path}.real"' \
+      '' \
+      'if [ "${1:-}" != "cc" ] && [ "${1:-}" != "c++" ]; then' \
+      '  exec "$real_zig" "$@"' \
+      'fi' \
+      '' \
+      'subcommand="$1"' \
+      'shift' \
+      'out=("$subcommand")' \
+      'declare -A seen_libs=()' \
+      'declare -A seen_frameworks=()' \
+      '' \
+      'dedupe_lib() {' \
+      '  case "$1" in' \
+      '    objc|iconv|System|c|m|z|charset|c++)' \
+      '      return 0' \
+      '      ;;' \
+      '    *)' \
+      '      return 1' \
+      '      ;;' \
+      '  esac' \
+      '}' \
+      '' \
+      'while [ "$#" -gt 0 ]; do' \
+      '  arg="$1"' \
+      '  shift' \
+      '  case "$arg" in' \
+      '    -l)' \
+      '      if [ "$#" -gt 0 ] && dedupe_lib "$1"; then' \
+      '        lib="$1"' \
+      '        shift' \
+      '        if [ -z "${seen_libs[$lib]+x}" ]; then' \
+      '          seen_libs[$lib]=1' \
+      '          out+=("-l" "$lib")' \
+      '        fi' \
+      '      else' \
+      '        out+=("$arg")' \
+      '      fi' \
+      '      ;;' \
+      '    -l*)' \
+      '      lib="${arg#-l}"' \
+      '      if dedupe_lib "$lib"; then' \
+      '        if [ -z "${seen_libs[$lib]+x}" ]; then' \
+      '          seen_libs[$lib]=1' \
+      '          out+=("$arg")' \
+      '        fi' \
+      '      else' \
+      '        out+=("$arg")' \
+      '      fi' \
+      '      ;;' \
+      '    -framework)' \
+      '      if [ "$#" -gt 0 ]; then' \
+      '        framework="$1"' \
+      '        framework_key="${framework,,}"' \
+      '        shift' \
+      '        if [ -z "${seen_frameworks[$framework_key]+x}" ]; then' \
+      '          seen_frameworks[$framework_key]=1' \
+      '          out+=("-framework" "$framework")' \
+      '        fi' \
+      '      else' \
+      '        out+=("$arg")' \
+      '      fi' \
+      '      ;;' \
+      '    *)' \
+      '      out+=("$arg")' \
+      '      ;;' \
+      '  esac' \
+      'done' \
+      '' \
+      'exec "$real_zig" "${out[@]}"' \
+      > "$real_zig"; \
+    chmod +x "$real_zig"; \
+    zig version

@@ -1,11 +1,11 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    macos_build::run();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        macos_build::run();
+    }
 }
 
-#[cfg(target_os = "macos")]
 mod macos_build {
     use std::{
         env,

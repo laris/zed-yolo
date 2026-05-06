@@ -1,0 +1,116 @@
+# CNB workspace build for the Zed YOLO fork.
+# Source base: zed-industries/zed v1.20.0-pre (preview).
+#
+# This is a Stage-1 Linux -> macOS compile path. It does not produce a signed
+# .app/.dmg yet; local macOS or a later rcodesign stage should bundle/sign.
+$:
+  vscode:
+    - name: zed-yolo-macos-compile
+      runner:
+        cpus: 16
+        tags: cnb:arch:amd64
+      docker:
+        build:
+          dockerfile: .cnb/Dockerfile.zed-macos
+          by:
+            - .cnb/Dockerfile.zed-macos
+            - Cargo.toml
+            - Cargo.lock
+            - rust-toolchain.toml
+        volumes:
+          - zed-yolo-cargo-registry:/usr/local/cargo/registry:rw
+          - zed-yolo-cargo-git:/usr/local/cargo/git:rw
+          - zed-yolo-sccache-cpu16-cold:/var/cache/sccache:rw
+          - zed-yolo-target-cpu16-cold:/workspace/target:rw
+      services:
+        - name: vscode
+          options:
+            onlyPreview: true
+            keepAliveTimeout: 30m
+      env:
+        CARGO_INCREMENTAL: "0"
+        CARGO_TERM_COLOR: always
+        CARGO_TERM_PROGRESS_WHEN: always
+        CARGO_TERM_PROGRESS_WIDTH: "120"
+        BUILD_LOG_POLL_SECONDS: "5"
+        BUILD_HEARTBEAT_SECONDS: "60"
+        CARGO_BUILD_JOBS: "16"
+        RUSTC_WRAPPER: sccache
+        SCCACHE_DIR: /var/cache/sccache
+        SCCACHE_CACHE_SIZE: 80G
+        RELEASE_TAG: zed-yolo-v1.20.0-pre-enhanced
+        ZED_YOLO_RUNNER_CPUS: "16"
+        ZED_YOLO_RUNNER_MEMORY_GIB: "32"
+        ZED_YOLO_BENCHMARK: "cpu16-cold-target-cold-sccache"
+        ZED_ENHANCED_LABEL: Enhanced
+      stages:
+        - name: toolchain
+          script: |
+            set -eux
+            rustc -Vv
+            cargo -V
+            nproc
+            free -h
+            cargo zigbuild --help >/dev/null
+            zig version
+            printf 'SDKROOT=%s\n' "${SDKROOT:-}"
+            test -n "${SDKROOT:-}"
+            test -d "$SDKROOT"
+            test -e "$SDKROOT/usr/lib/libclang_rt.osx.a"
+            test -e "$SDKROOT/System/Library/Frameworks/Appkit.framework/Appkit.tbd"
+            test -d "$SDKROOT/System/Library/Frameworks/ScreenCaptureKit.framework"
+            sccache --show-stats || true
+        - name: macho-linker-dedupe-smoke
+          script: bash .cnb/run-zed-build-step.sh macho-smoke
+        - name: generate-licenses
+          script: |
+            set -eux
+            ALLOW_MISSING_LICENSES=yes script/generate-licenses
+        - name: init-release-metadata
+          script: bash .cnb/run-zed-build-step.sh metadata
+        - name: build-aarch64-apple-darwin-zed-cli
+          script: >
+            bash .cnb/run-zed-build-step.sh build
+            aarch64-apple-darwin zed-cli
+            --package zed --package cli
+        - name: package-aarch64-apple-darwin-zed-cli
+          script: bash .cnb/run-zed-build-step.sh package aarch64-apple-darwin zed-cli
+
+        # Default client/app target is aarch64 macOS only. Keep x86_64 macOS
+        # and Linux app builds disabled unless we explicitly need them.
+        #
+        # Default remote-server targets are x86_64 Linux GNU + musl: the
+        # immediate deployment goal is macOS arm64 local client plus Linux
+        # remote hosts with both glibc and musl compatibility.
+        - name: build-x86_64-unknown-linux-gnu-remote-server
+          script: >
+            bash .cnb/run-zed-build-step.sh build
+            x86_64-unknown-linux-gnu remote-server
+            --package remote_server
+        - name: package-x86_64-unknown-linux-gnu-remote-server
+          script: bash .cnb/run-zed-build-step.sh package x86_64-unknown-linux-gnu remote-server
+        - name: build-x86_64-unknown-linux-musl-remote-server
+          script: >
+            bash .cnb/run-zed-build-step.sh build
+            x86_64-unknown-linux-musl remote-server
+            --package remote_server
+        - name: package-x86_64-unknown-linux-musl-remote-server
+          script: bash .cnb/run-zed-build-step.sh package x86_64-unknown-linux-musl remote-server
+        - name: build-cache-stats
+          script: bash .cnb/run-zed-build-step.sh stats
+        - name: upload-workspace-artifacts
+          image: cnbcool/attachments:latest
+          settings:
+            tag: $RELEASE_TAG
+            attachments:
+              - "dist/zed-yolo-v*.tar.zst"
+              - "dist/zed-yolo-v*.tar.zst.sha256"
+              - "dist/zed-yolo-v*.tar.zst.build.json"
+              - "dist/zed-remote-server-linux-x86_64-*.gz"
+              - "dist/zed-remote-server-linux-x86_64-*.gz.sha256"
+        - name: cleanup-workspace-dist
+          script: |
+            set -eux
+            find dist -maxdepth 1 -type f -name 'zed-yolo-v*' -print || true
+            rm -rf dist
+            git status --short --untracked-files=all

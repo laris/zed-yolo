@@ -86,11 +86,22 @@ script/generate-licenses
 
 rustup target add $target_triple
 
+# When the host has only the Command Line Tools (no full Xcode), the `metal`
+# compiler is missing and ahead-of-time shader compilation fails. Detect that
+# and fall back to runtime shader compilation, matching the cross-build path.
+zed_features=()
+if ! xcrun --find metal >/dev/null 2>&1; then
+    echo "metal compiler not available; using gpui_platform/runtime_shaders"
+    zed_features=(--features gpui_platform/runtime_shaders)
+fi
+
 echo "Compiling zed binaries"
-cargo --config .cargo/bundle-config.toml build ${build_flag} --package zed --package cli --target $target_triple
+cargo --config .cargo/bundle-config.toml build ${build_flag} --package zed --package cli --target $target_triple ${zed_features[@]+"${zed_features[@]}"}
 # Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple
+# from influencing dynamic libraries required by it. The remote_server depends
+# on gpui_platform (which pulls in gpui_macos on Darwin), so it needs the same
+# shader feature when the host has no `metal` compiler.
+cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple ${zed_features[@]+"${zed_features[@]}"}
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -100,7 +111,7 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root ${zed_features[@]+"${zed_features[@]}"} | xargs)
 
 mv Cargo.toml.backup Cargo.toml
 popd
@@ -283,6 +294,29 @@ function sign_app_binaries() {
     fi
 }
 
+function copy_enhanced_remote_servers() {
+    local resource_dir="${app_path}/Contents/Resources/remote_servers"
+    mkdir -p "${resource_dir}"
+    shopt -s nullglob
+    local copied=false
+    local remote_server_assets=(
+        dist/zed-remote-server-linux-*.gz
+        target/zed-remote-server-linux-*.gz
+    )
+    for asset in ${remote_server_assets[@]+"${remote_server_assets[@]}"}; do
+        cp "${asset}" "${resource_dir}/$(basename "${asset}")"
+        copied=true
+    done
+    shopt -u nullglob
+
+    if [[ "${copied}" = true ]]; then
+        echo "Copied enhanced remote server assets into ${resource_dir}"
+        ls -lh "${resource_dir}"/zed-remote-server-linux-*.gz
+    else
+        echo "No enhanced Linux remote server assets found to bundle"
+    fi
+}
+
 function sign_binary() {
     local binary_path=$1
 
@@ -350,6 +384,7 @@ fi
 
 cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+copy_enhanced_remote_servers
 sign_app_binaries
 
 sign_binary "target/$target_triple/release/remote_server"
