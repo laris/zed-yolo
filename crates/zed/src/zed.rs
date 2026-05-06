@@ -82,6 +82,7 @@ use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 
 use std::{
     borrow::Cow,
+    env,
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{self, AtomicBool},
@@ -1544,16 +1545,54 @@ fn open_about_window(cx: &mut App) {
         copy_entry: NavigableEntry,
         app_icon: Arc<Image>,
         message: SharedString,
+        enhanced_label: Option<SharedString>,
         commit: Option<SharedString>,
         full_version: SharedString,
     }
 
+    fn enhanced_build_label() -> Option<String> {
+        let explicit_off = |value: &str| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off" | "disabled"
+            )
+        };
+        if env::var("ZED_ENHANCED").is_ok_and(|value| explicit_off(&value)) {
+            return None;
+        }
+
+        let label = env::var("ZED_ENHANCED_LABEL")
+            .ok()
+            .or_else(|| option_env!("ZED_ENHANCED_LABEL").map(str::to_owned))
+            .or_else(|| match option_env!("ZED_ENHANCED") {
+                Some("1") | Some("true") | Some("yes") | Some("on") => Some("Enhanced".to_owned()),
+                Some(label) if !label.trim().is_empty() => Some(label.to_owned()),
+                _ => Some("Enhanced".to_owned()),
+            })
+            .unwrap_or_else(|| "Enhanced".to_owned());
+        match label.trim() {
+            trimmed if explicit_off(trimmed) => None,
+            "" => Some("Enhanced".to_owned()),
+            trimmed => Some(trimmed.to_owned()),
+        }
+    }
+
     impl AboutWindow {
+        fn title_message(&self) -> SharedString {
+            self.enhanced_label
+                .as_ref()
+                .map(|enhanced_label| {
+                    format!("{} {}", self.message.as_str(), enhanced_label.as_str()).into()
+                })
+                .unwrap_or_else(|| self.message.clone())
+        }
+
         fn new(cx: &mut Context<Self>) -> Self {
             let release_channel = ReleaseChannel::global(cx);
             let release_channel_name = release_channel.display_name();
             let full_version: SharedString = AppVersion::global(cx).to_string().into();
             let version = env!("CARGO_PKG_VERSION");
+            let enhanced_label = enhanced_build_label().map(SharedString::from);
 
             let debug = if cfg!(debug_assertions) {
                 "(debug)"
@@ -1572,20 +1611,29 @@ fn open_about_window(cx: &mut App) {
                 copy_entry: NavigableEntry::focusable(cx),
                 app_icon: about_window_icon(release_channel),
                 message,
+                enhanced_label,
                 commit,
                 full_version,
             }
         }
 
         fn copy_details(&self, window: &mut Window, cx: &mut Context<Self>) {
+            let enhanced = self
+                .enhanced_label
+                .as_ref()
+                .map(|label| format!("\nBuild: {label}"))
+                .unwrap_or_default();
             let content = match self.commit.as_ref() {
                 Some(commit) => {
                     format!(
-                        "{}\nCommit: {}\nVersion: {}",
-                        self.message, commit, self.full_version
+                        "{}{}\nCommit: {}\nVersion: {}",
+                        self.message, enhanced, commit, self.full_version
                     )
                 }
-                None => format!("{}\nVersion: {}", self.message, self.full_version),
+                None => format!(
+                    "{}{}\nVersion: {}",
+                    self.message, enhanced, self.full_version
+                ),
             };
             cx.write_to_clipboard(ClipboardItem::new_string(content));
             window.remove_window();
@@ -1619,7 +1667,7 @@ fn open_about_window(cx: &mut App) {
                             .gap_2()
                             .items_center()
                             .child(img(self.app_icon.clone()).size_16().flex_none())
-                            .child(Headline::new(self.message.clone()))
+                            .child(Headline::new(self.title_message()))
                             .when_some(self.commit.clone(), |this, commit| {
                                 this.child(
                                     Label::new("Commit")
