@@ -71,6 +71,10 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: false
     pub reveal_if_open: Option<bool>,
+    /// Enhanced fork project-manager controls for `.code-workspace` backed
+    /// multi-root identity. This is intentionally disabled by default until
+    /// the source-native persistence path is wired and tested.
+    pub project_manager: Option<ProjectManagerSettingsContent>,
     /// The size of the workspace split drop targets on the outer edges.
     /// Given as a fraction that will be multiplied by the smaller dimension of the workspace.
     ///
@@ -202,6 +206,49 @@ pub struct ItemSettingsContent {
     ///
     /// Default: false
     pub show_close_button: Option<ShowCloseButton>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ProjectManagerSettingsContent {
+    /// Master switch for source-native project management.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Synchronize Zed workspace state with a persistent `.code-workspace`
+    /// manifest.
+    ///
+    /// Default: true
+    pub code_workspace_sync: Option<bool>,
+    /// Create a `.code-workspace` manifest when a named multi-root project has
+    /// no manifest yet.
+    ///
+    /// Default: true
+    pub auto_create_code_workspace: Option<bool>,
+    /// Keep the project primary root first in user-visible workspace order.
+    ///
+    /// Default: true
+    pub pin_primary_root: Option<bool>,
+    /// Watch for external `.code-workspace` edits and reconcile them with the
+    /// current Zed workspace.
+    ///
+    /// Default: true
+    pub reconcile_external_file_edits: Option<bool>,
+    /// Write a deterministic sidecar instead of overwriting a user-edited
+    /// `.code-workspace` manifest when DB and file state diverge.
+    ///
+    /// Default: true
+    pub write_sidecars_on_divergence: Option<bool>,
+    /// Expand a partial Zed open back to the full `.code-workspace` manifest
+    /// automatically. Kept off because partial opens are often intentional.
+    ///
+    /// Default: false
+    pub auto_expand_partial_open: Option<bool>,
+    /// Migrate stored workspace identity when the primary root is renamed.
+    /// Kept off until the DB transaction path is source-native and tested.
+    ///
+    /// Default: false
+    pub migrate_on_primary_rename: Option<bool>,
 }
 
 #[with_fallible_options]
