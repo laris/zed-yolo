@@ -192,6 +192,33 @@
   "restore_on_file_reopen": true,
   // Whether to reveal an already open file in an existing pane instead of opening it in the active pane.
   "reveal_if_open": false,
+  // Enhanced fork project-manager controls. Disabled by default until the
+  // source-native `.code-workspace` persistence path is wired and tested.
+  //
+  // "enabled" is the master switch.
+  // "code_workspace_sync" synchronizes Zed's workspace DB with a persistent
+  // `.code-workspace` manifest.
+  // "auto_create_code_workspace" creates the manifest for named multi-root
+  // projects when it is missing.
+  // "pin_primary_root" keeps the primary project root first in the visible
+  // folder order.
+  // "reconcile_external_file_edits" watches hand-edited manifests.
+  // "write_sidecars_on_divergence" preserves user-edited manifests by writing
+  // a deterministic sidecar when DB and file state disagree.
+  // "auto_expand_partial_open" reopens the full manifest from a partial Zed
+  // open; it is off because partial opens are often intentional.
+  // "migrate_on_primary_rename" updates stored identity when the primary root
+  // is renamed; it is off until the source-native DB migration path is wired.
+  "project_manager": {
+    "enabled": false,
+    "code_workspace_sync": true,
+    "auto_create_code_workspace": true,
+    "pin_primary_root": true,
+    "reconcile_external_file_edits": true,
+    "write_sidecars_on_divergence": true,
+    "auto_expand_partial_open": false,
+    "migrate_on_primary_rename": false,
+  },
   // Whether to automatically close files that have been deleted on disk.
   "close_on_file_delete": false,
   // Whether invoking a panel's ToggleFocus action while the panel is already

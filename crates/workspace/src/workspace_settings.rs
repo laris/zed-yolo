@@ -26,6 +26,7 @@ pub struct WorkspaceSettings {
     pub default_open_behavior: settings::DefaultOpenBehavior,
     pub restore_on_file_reopen: bool,
     pub reveal_if_open: bool,
+    pub project_manager: ProjectManagerSettings,
     pub drop_target_size: f32,
     pub use_system_path_prompts: bool,
     pub use_system_prompts: bool,
@@ -64,6 +65,34 @@ pub fn closing_last_window_quits_app(_cx: &App) -> bool {
 pub struct FocusFollowsMouse {
     pub enabled: bool,
     pub debounce: Duration,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProjectManagerSettings {
+    pub enabled: bool,
+    pub code_workspace_sync: bool,
+    pub auto_create_code_workspace: bool,
+    pub pin_primary_root: bool,
+    pub reconcile_external_file_edits: bool,
+    pub write_sidecars_on_divergence: bool,
+    pub auto_expand_partial_open: bool,
+    pub migrate_on_primary_rename: bool,
+}
+
+impl ProjectManagerSettings {
+    fn from_content(content: Option<settings::ProjectManagerSettingsContent>) -> Self {
+        let content = content.unwrap_or_default();
+        Self {
+            enabled: content.enabled.unwrap_or(false),
+            code_workspace_sync: content.code_workspace_sync.unwrap_or(true),
+            auto_create_code_workspace: content.auto_create_code_workspace.unwrap_or(true),
+            pin_primary_root: content.pin_primary_root.unwrap_or(true),
+            reconcile_external_file_edits: content.reconcile_external_file_edits.unwrap_or(true),
+            write_sidecars_on_divergence: content.write_sidecars_on_divergence.unwrap_or(true),
+            auto_expand_partial_open: content.auto_expand_partial_open.unwrap_or(false),
+            migrate_on_primary_rename: content.migrate_on_primary_rename.unwrap_or(false),
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Debug, Default)]
@@ -125,6 +154,9 @@ impl Settings for WorkspaceSettings {
             default_open_behavior: workspace.default_open_behavior.unwrap(),
             restore_on_file_reopen: workspace.restore_on_file_reopen.unwrap(),
             reveal_if_open: workspace.reveal_if_open.unwrap(),
+            project_manager: ProjectManagerSettings::from_content(
+                workspace.project_manager.clone(),
+            ),
             drop_target_size: workspace.drop_target_size.unwrap(),
             use_system_path_prompts: workspace.use_system_path_prompts.unwrap(),
             use_system_prompts: workspace.use_system_prompts.unwrap(),
