@@ -858,6 +858,18 @@ impl ThreadView {
             && project.upgrade().is_some_and(|p| p.read(cx).is_local())
             && agent_id.as_ref() == "Codex";
 
+        if let Some(config_options_view) = &config_options_view {
+            subscriptions.push(cx.subscribe_in(
+                config_options_view,
+                window,
+                |this, _, event: &ConfigOptionsViewEvent, window, cx| match event {
+                    ConfigOptionsViewEvent::RunCommand { command } => {
+                        this.run_config_option_command(command.clone(), window, cx);
+                    }
+                },
+            ));
+        }
+
         if let Some(project) = project.upgrade() {
             subscriptions.push(cx.subscribe(&project, {
                 let resolver = code_span_resolver.clone();
@@ -1055,6 +1067,19 @@ impl ThreadView {
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
+
+        // Only for top-level threads that haven't started: resumed threads
+        // already ran whatever model command they were opened with, and
+        // subagents inherit their model from the parent rather than settings.
+        let is_unstarted_root_thread = {
+            let thread = this.thread.read(cx);
+            thread.entries().is_empty() && thread.parent_session_id().is_none()
+        };
+        if !this.resumed_without_history && is_unstarted_root_thread {
+            cx.defer_in(window, |this, window, cx| {
+                this.apply_unadvertised_default_config_options(window, cx);
+            });
+        }
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
 
@@ -1550,6 +1575,44 @@ impl ThreadView {
 
         cx.emit(AcpThreadViewEvent::Interacted);
         self.send_impl(message_editor, window, cx)
+    }
+
+    /// Applies a config option value the agent never advertised. Those values
+    /// are rejected by `session/set_config_option`, so they are applied by
+    /// running the equivalent slash command, which takes a free-form id and
+    /// validates it against the account.
+    fn run_config_option_command(
+        &mut self,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let command_block = acp::ContentBlock::Text(acp::TextContent::new(command));
+        cx.emit(AcpThreadViewEvent::Interacted);
+        self.send_content(
+            Task::ready(Ok(Some((vec![command_block], Vec::new())))),
+            true,
+            window,
+            cx,
+        );
+    }
+
+    /// Applies a `default_config_options` model the agent doesn't advertise.
+    /// Advertised defaults are handled by the ACP connection, which silently
+    /// skips values missing from the option list.
+    fn apply_unadvertised_default_config_options(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config_options_view) = self.config_options_view.clone() else {
+            return;
+        };
+        let command =
+            config_options_view.update(cx, |view, cx| view.unadvertised_default_command(cx));
+        if let Some(command) = command {
+            self.run_config_option_command(command, window, cx);
+        }
     }
 
     /// Sends a bare `/command` turn and queues everything the user typed after

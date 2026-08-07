@@ -75,7 +75,7 @@ use workspace::{
 };
 use zed_actions::agent::{Chat, ToggleModelSelector};
 
-use super::config_options::ConfigOptionsView;
+use super::config_options::{ConfigOptionsView, ConfigOptionsViewEvent};
 use super::entry_view_state::EntryViewState;
 use crate::ModeSelector;
 use crate::ModelSelectorPopover;
