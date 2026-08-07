@@ -1,14 +1,15 @@
-use std::{cmp::Reverse, rc::Rc, sync::Arc};
+use std::{cell::RefCell, cmp::Reverse, rc::Rc, sync::Arc};
 
 use acp_thread::AgentSessionConfigOptions;
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
 
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use fs::Fs;
 use fuzzy::StringMatchCandidate;
 use gpui::{
-    App, BackgroundExecutor, Context, DismissEvent, Entity, Subscription, Task, Window, prelude::*,
+    App, BackgroundExecutor, Context, DismissEvent, Entity, EventEmitter, Subscription, Task,
+    WeakEntity, Window, prelude::*,
 };
 use ordered_float::OrderedFloat;
 use picker::popover_menu::PickerPopoverMenu;
@@ -30,14 +31,39 @@ use crate::{
 
 const PICKER_THRESHOLD: usize = 5;
 
+/// Slash command used to reach models the agent doesn't advertise. Unlike
+/// `session/set_config_option`, which agents reject for unknown values, this
+/// takes a free-form model id and validates it against the account.
+const MODEL_COMMAND: &str = "/model";
+
+/// Groups the injected values so they don't read as part of whichever group the
+/// agent's own options happened to end on.
+const UNADVERTISED_GROUP: &str = "From Settings";
+
+/// Values chosen through [`ConfigOptionsViewEvent::RunCommand`] are invisible to
+/// the agent's config option state, so it keeps reporting the previous
+/// `current_value`. Remember the local choice so the UI doesn't claim otherwise.
+type ValueOverrides = Rc<RefCell<HashMap<acp::SessionConfigId, acp::SessionConfigValueId>>>;
+
+pub enum ConfigOptionsViewEvent {
+    /// A value the agent never advertised was selected. It cannot go through
+    /// `session/set_config_option`, which agents reject for unknown values, so
+    /// it is applied by sending this slash command as a prompt instead.
+    RunCommand { command: String },
+}
+
 pub struct ConfigOptionsView {
     config_options: Rc<dyn AgentSessionConfigOptions>,
     selectors: Vec<Entity<ConfigOptionSelector>>,
     agent_server: Rc<dyn AgentServer>,
     fs: Arc<dyn Fs>,
     config_option_ids: Vec<acp::SessionConfigId>,
+    overrides: ValueOverrides,
+    _selector_subscriptions: Vec<Subscription>,
     _refresh_task: Task<()>,
 }
+
+impl EventEmitter<ConfigOptionsViewEvent> for ConfigOptionsView {}
 
 impl ConfigOptionsView {
     pub fn new(
@@ -47,7 +73,15 @@ impl ConfigOptionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let selectors = Self::build_selectors(&config_options, &agent_server, &fs, window, cx);
+        let overrides = ValueOverrides::default();
+        let (selectors, selector_subscriptions) = Self::build_selectors(
+            &config_options,
+            &agent_server,
+            &fs,
+            &overrides,
+            window,
+            cx,
+        );
         let config_option_ids = Self::config_option_ids(&config_options);
 
         let rx = config_options.watch(cx);
@@ -69,8 +103,39 @@ impl ConfigOptionsView {
             agent_server,
             fs,
             config_option_ids,
+            overrides,
+            _selector_subscriptions: selector_subscriptions,
             _refresh_task: refresh_task,
         }
+    }
+
+    /// The command needed to apply a `default_config_options` model that the
+    /// agent doesn't advertise. Advertised defaults are already applied by the
+    /// ACP connection, which skips values it can't find in the option list.
+    pub fn unadvertised_default_command(&self, cx: &mut App) -> Option<String> {
+        let config_id = self.first_config_option_id_matching(
+            acp::SessionConfigOptionCategory::Model,
+            |option| matches!(&option.kind, acp::SessionConfigKind::Select(_)),
+        )?;
+
+        let default = self
+            .agent_server
+            .default_config_option(config_id.0.as_ref(), cx)?;
+        let value_id = default.as_value_id()?;
+
+        let advertised = extract_options(&self.config_options, &config_id);
+        if advertised
+            .iter()
+            .any(|option| &*option.value.0 == value_id)
+        {
+            return None;
+        }
+
+        self.overrides.borrow_mut().insert(
+            config_id,
+            acp::SessionConfigValueId::new(value_id.to_string()),
+        );
+        Some(format!("{MODEL_COMMAND} {value_id}"))
     }
 
     pub fn toggle_category_picker(
@@ -104,7 +169,9 @@ impl ConfigOptionsView {
             return false;
         };
 
-        let Some(next_value) = self.next_value_for_config(&config_id, favorites_only, cx) else {
+        let Some((next_value, unadvertised)) =
+            self.next_value_for_config(&config_id, favorites_only, cx)
+        else {
             return false;
         };
         let default_value = setting_value_for_config_option_value(&next_value);
@@ -115,6 +182,16 @@ impl ConfigOptionsView {
             self.fs.clone(),
             cx,
         );
+
+        if let Some(value_id) = unadvertised {
+            cx.emit(ConfigOptionsViewEvent::RunCommand {
+                command: format!("{MODEL_COMMAND} {}", value_id.0),
+            });
+            self.overrides.borrow_mut().insert(config_id, value_id);
+            return true;
+        }
+
+        self.overrides.borrow_mut().remove(&config_id);
 
         let task = self
             .config_options
@@ -161,12 +238,17 @@ impl ConfigOptionsView {
             .cloned()
     }
 
+    /// Returns the value to switch to, plus its id when that value is one the
+    /// agent never advertised and so has to be applied as a command.
     fn next_value_for_config(
         &self,
         config_id: &acp::SessionConfigId,
         favorites_only: bool,
         cx: &mut Context<Self>,
-    ) -> Option<acp::SessionConfigOptionValue> {
+    ) -> Option<(
+        acp::SessionConfigOptionValue,
+        Option<acp::SessionConfigValueId>,
+    )> {
         let option = self
             .config_options
             .config_options()
@@ -175,7 +257,12 @@ impl ConfigOptionsView {
 
         match &option.kind {
             acp::SessionConfigKind::Select(_) => {
-                let mut options = extract_options(&self.config_options, config_id);
+                let mut options = extract_options_with_unadvertised(
+                    &self.config_options,
+                    config_id,
+                    &self.agent_server,
+                    cx,
+                );
                 if options.is_empty() {
                     return None;
                 }
@@ -190,7 +277,12 @@ impl ConfigOptionsView {
                     }
                 }
 
-                let current_value = get_current_select_value(&self.config_options, config_id);
+                let current_value = self
+                    .overrides
+                    .borrow()
+                    .get(config_id)
+                    .cloned()
+                    .or_else(|| get_current_select_value(&self.config_options, config_id));
                 let current_index = current_value
                     .as_ref()
                     .and_then(|current| options.iter().position(|option| &option.value == current))
@@ -202,16 +294,19 @@ impl ConfigOptionsView {
                     (current_index + 1) % options.len()
                 };
 
-                Some(acp::SessionConfigOptionValue::value_id(
-                    options[next_index].value.clone(),
+                let next = options.get(next_index)?;
+                Some((
+                    acp::SessionConfigOptionValue::value_id(next.value.clone()),
+                    next.unadvertised.then(|| next.value.clone()),
                 ))
             }
             acp::SessionConfigKind::Boolean(boolean) => {
                 if favorites_only {
                     None
                 } else {
-                    Some(acp::SessionConfigOptionValue::boolean(
-                        !boolean.current_value,
+                    Some((
+                        acp::SessionConfigOptionValue::boolean(!boolean.current_value),
+                        None,
                     ))
                 }
             }
@@ -233,13 +328,16 @@ impl ConfigOptionsView {
         // Config option updates can mutate option values for existing IDs (for example,
         // reasoning levels after a model switch). Rebuild to refresh cached picker entries.
         self.config_option_ids = Self::config_option_ids(&self.config_options);
-        self.selectors = Self::build_selectors(
+        let (selectors, subscriptions) = Self::build_selectors(
             &self.config_options,
             &self.agent_server,
             &self.fs,
+            &self.overrides,
             window,
             cx,
         );
+        self.selectors = selectors;
+        self._selector_subscriptions = subscriptions;
         cx.notify();
     }
 
@@ -247,28 +345,46 @@ impl ConfigOptionsView {
         config_options: &Rc<dyn AgentSessionConfigOptions>,
         agent_server: &Rc<dyn AgentServer>,
         fs: &Arc<dyn Fs>,
+        overrides: &ValueOverrides,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<Entity<ConfigOptionSelector>> {
-        config_options
-            .config_options()
-            .into_iter()
-            .map(|option| {
+    ) -> (Vec<Entity<ConfigOptionSelector>>, Vec<Subscription>) {
+        let mut selectors = Vec::new();
+        let mut subscriptions = Vec::new();
+
+        for option in config_options.config_options() {
+            let selector = {
                 let config_options = config_options.clone();
                 let agent_server = agent_server.clone();
                 let fs = fs.clone();
+                let overrides = overrides.clone();
                 cx.new(|cx| {
                     ConfigOptionSelector::new(
                         config_options,
                         option.id.clone(),
                         agent_server,
                         fs,
+                        overrides,
                         window,
                         cx,
                     )
                 })
-            })
-            .collect()
+            };
+
+            subscriptions.push(cx.subscribe(
+                &selector,
+                |_, _, event: &ConfigOptionsViewEvent, cx| match event {
+                    ConfigOptionsViewEvent::RunCommand { command } => {
+                        cx.emit(ConfigOptionsViewEvent::RunCommand {
+                            command: command.clone(),
+                        });
+                    }
+                },
+            ));
+            selectors.push(selector);
+        }
+
+        (selectors, subscriptions)
     }
 }
 
@@ -294,8 +410,11 @@ struct ConfigOptionSelector {
     fs: Arc<dyn Fs>,
     picker_handle: Option<PopoverMenuHandle<Picker<ConfigOptionPickerDelegate>>>,
     picker: Option<Entity<Picker<ConfigOptionPickerDelegate>>>,
+    overrides: ValueOverrides,
     setting_value: bool,
 }
+
+impl EventEmitter<ConfigOptionsViewEvent> for ConfigOptionSelector {}
 
 impl ConfigOptionSelector {
     pub fn new(
@@ -303,6 +422,7 @@ impl ConfigOptionSelector {
         config_id: acp::SessionConfigId,
         agent_server: Rc<dyn AgentServer>,
         fs: Arc<dyn Fs>,
+        overrides: ValueOverrides,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -325,12 +445,16 @@ impl ConfigOptionSelector {
             let config_id = config_id.clone();
             let agent_server = agent_server.clone();
             let fs = fs.clone();
+            let overrides = overrides.clone();
+            let selector = cx.weak_entity();
             let picker = cx.new(move |picker_cx| {
                 let delegate = ConfigOptionPickerDelegate::new(
                     config_options,
                     config_id,
                     agent_server,
                     fs,
+                    overrides,
+                    selector,
                     window,
                     picker_cx,
                 );
@@ -355,6 +479,7 @@ impl ConfigOptionSelector {
             fs,
             picker_handle,
             picker,
+            overrides,
             setting_value: false,
         }
     }
@@ -386,6 +511,10 @@ impl ConfigOptionSelector {
 
         match &option.kind {
             acp::SessionConfigKind::Select(select) => {
+                if let Some(value) = self.overrides.borrow().get(&self.config_id) {
+                    return find_option_name(&select.options, value)
+                        .unwrap_or_else(|| value.0.to_string());
+                }
                 find_option_name(&select.options, &select.current_value)
                     .unwrap_or_else(|| "Unknown".to_string())
             }
@@ -627,6 +756,9 @@ struct ConfigOptionValue {
     name: String,
     description: Option<String>,
     group: Option<String>,
+    /// Injected from favorites rather than offered by the agent, so it can only
+    /// be applied by command.
+    unadvertised: bool,
 }
 
 struct ConfigOptionPickerDelegate {
@@ -639,6 +771,8 @@ struct ConfigOptionPickerDelegate {
     selected_index: usize,
     selected_description: Option<(usize, SharedString)>,
     favorites: HashSet<acp::SessionConfigValueId>,
+    overrides: ValueOverrides,
+    selector: WeakEntity<ConfigOptionSelector>,
     _settings_subscription: Subscription,
 }
 
@@ -648,15 +782,22 @@ impl ConfigOptionPickerDelegate {
         config_id: acp::SessionConfigId,
         agent_server: Rc<dyn AgentServer>,
         fs: Arc<dyn Fs>,
+        overrides: ValueOverrides,
+        selector: WeakEntity<ConfigOptionSelector>,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Self {
         let favorites = agent_server.favorite_config_option_value_ids(&config_id, cx);
 
-        let all_options = extract_options(&config_options, &config_id);
+        let all_options =
+            extract_options_with_unadvertised(&config_options, &config_id, &agent_server, cx);
         let filtered_entries = options_to_picker_entries(&all_options, &favorites);
 
-        let current_value = get_current_select_value(&config_options, &config_id);
+        let current_value = overrides
+            .borrow()
+            .get(&config_id)
+            .cloned()
+            .or_else(|| get_current_select_value(&config_options, &config_id));
         let selected_index = current_value
             .and_then(|current| {
                 filtered_entries.iter().position(|entry| {
@@ -673,6 +814,15 @@ impl ConfigOptionPickerDelegate {
                     .favorite_config_option_value_ids(&config_id_for_subscription, cx);
                 if new_favorites != picker.delegate.favorites {
                     picker.delegate.favorites = new_favorites;
+                    // Favorites double as the source of unadvertised values, so
+                    // the option list itself has to be rebuilt, not just re-sorted.
+                    let config_options = picker.delegate.config_options.clone();
+                    picker.delegate.all_options = extract_options_with_unadvertised(
+                        &config_options,
+                        &config_id_for_subscription,
+                        &agent_server_for_subscription,
+                        cx,
+                    );
                     picker.refresh(window, cx);
                 }
             });
@@ -689,12 +839,18 @@ impl ConfigOptionPickerDelegate {
             selected_index,
             selected_description: None,
             favorites,
+            overrides,
+            selector,
             _settings_subscription: settings_subscription,
         }
     }
 
     fn current_value(&self) -> Option<acp::SessionConfigValueId> {
-        get_current_select_value(&self.config_options, &self.config_id)
+        self.overrides
+            .borrow()
+            .get(&self.config_id)
+            .cloned()
+            .or_else(|| get_current_select_value(&self.config_options, &self.config_id))
     }
 }
 
@@ -777,15 +933,36 @@ impl PickerDelegate for ConfigOptionPickerDelegate {
         if let Some(ConfigOptionPickerEntry::Option(option)) =
             self.filtered_entries.get(self.selected_index)
         {
+            let value = option.value.clone();
+            let unadvertised = option.unadvertised;
+
             self.agent_server.set_default_config_option(
                 self.config_id.0.as_ref(),
-                Some(AgentConfigOptionValue::ValueId(option.value.0.to_string())),
+                Some(AgentConfigOptionValue::ValueId(value.0.to_string())),
                 self.fs.clone(),
                 cx,
             );
+
+            if unadvertised {
+                self.overrides
+                    .borrow_mut()
+                    .insert(self.config_id.clone(), value.clone());
+                self.selector
+                    .update(cx, |_, cx| {
+                        cx.emit(ConfigOptionsViewEvent::RunCommand {
+                            command: format!("{MODEL_COMMAND} {}", value.0),
+                        });
+                        cx.notify();
+                    })
+                    .log_err();
+                cx.emit(DismissEvent);
+                return;
+            }
+
+            self.overrides.borrow_mut().remove(&self.config_id);
             let task = self.config_options.set_config_option(
                 self.config_id.clone(),
-                acp::SessionConfigOptionValue::value_id(option.value.clone()),
+                acp::SessionConfigOptionValue::value_id(value),
                 cx,
             );
 
@@ -937,6 +1114,7 @@ fn extract_options(
                     name: opt.name.clone(),
                     description: opt.description.clone(),
                     group: None,
+                    unadvertised: false,
                 })
                 .collect(),
             acp::SessionConfigSelectOptions::Grouped(groups) => groups
@@ -947,6 +1125,7 @@ fn extract_options(
                         name: opt.name.clone(),
                         description: opt.description.clone(),
                         group: Some(group.name.clone()),
+                        unadvertised: false,
                     })
                 })
                 .collect(),
@@ -954,6 +1133,57 @@ fn extract_options(
         },
         _ => Vec::new(),
     }
+}
+
+/// Agents can withhold models the account is still allowed to use: Claude Code
+/// only advertises a curated list, so models reachable via `/model <id>` never
+/// reach the picker. Favorited ids that aren't advertised are surfaced anyway,
+/// letting settings act as a hand-maintained list of extra models.
+fn extract_options_with_unadvertised(
+    config_options: &Rc<dyn AgentSessionConfigOptions>,
+    config_id: &acp::SessionConfigId,
+    agent_server: &Rc<dyn AgentServer>,
+    cx: &mut App,
+) -> Vec<ConfigOptionValue> {
+    let mut options = extract_options(config_options, config_id);
+
+    // Applying these requires a slash command, and `/model` is the only one we
+    // can name with confidence, so other categories stay advertised-only.
+    if !is_model_option(config_options, config_id) {
+        return options;
+    }
+
+    let mut unadvertised: Vec<_> = agent_server
+        .favorite_config_option_value_ids(config_id, cx)
+        .into_iter()
+        .filter(|value| !options.iter().any(|option| &option.value == value))
+        .collect();
+    unadvertised.sort_by(|left, right| left.0.cmp(&right.0));
+
+    options.extend(unadvertised.into_iter().map(|value| ConfigOptionValue {
+        name: value.0.to_string(),
+        description: Some(format!(
+            "Not advertised by this agent. Selecting it sends `{MODEL_COMMAND} {}`.",
+            value.0
+        )),
+        group: Some(UNADVERTISED_GROUP.to_string()),
+        unadvertised: true,
+        value,
+    }));
+
+    options
+}
+
+fn is_model_option(
+    config_options: &Rc<dyn AgentSessionConfigOptions>,
+    config_id: &acp::SessionConfigId,
+) -> bool {
+    config_options
+        .config_options()
+        .into_iter()
+        .find(|option| &option.id == config_id)
+        .and_then(|option| option.category)
+        == Some(acp::SessionConfigOptionCategory::Model)
 }
 
 fn get_current_select_value(
