@@ -363,7 +363,7 @@ earlier ones. The chronological order is:
 
 | # | Subject                                                          | Crates touched                                                       | Notes                                                                                 |
 | - | ---------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| 1 | `Add config-backed enhanced YOLO runtime`                        | `agent`, `agent_servers`, `agent_settings`, `agent_ui`, `settings_content` | Adds `EnhancedYoloSettings` to `AgentSettings`; opt-out via `agent.enhanced_yolo`. Includes the all-target test fixtures (folded at the 2026-07-05 compaction). |
+| 1 | `Add config-backed enhanced YOLO runtime`                        | `agent`, `agent_servers`, `agent_settings`, `agent_ui`, `settings_content` | Adds `EnhancedYoloSettings` to `AgentSettings`; opt-out via `agent.enhanced_yolo`. Includes the all-target test fixtures (folded at the 2026-07-05 compaction) and the codex MCP tool-approval elicitation auto-accept with its wire-shape unit test (folded at the 2026-08-07 compaction). |
 | 2 | `Show enhanced marker in About title`                            | `zed`                                                                | Reads `ZED_ENHANCED` / `ZED_ENHANCED_LABEL` env vars (build-time or runtime).         |
 | 3 | `Add enhanced project manager settings scaffold`                 | `settings`, `settings_content`, `workspace`                          | Placeholder schema only — no UI yet.                                                  |
 | 4 | `Add CNB cross-build infrastructure`                             | `.cnb.yml`, `.cnb/*`, `auto_update`, build scripts                   | Linux-host cross-build via Docker, `script/bundle-mac` mods (§3.7, incl. set-u fixes), and the bundled remote-server lookup in `auto_update` (moved here from patch #1 at the 2026-07-05 compaction). |
@@ -1030,8 +1030,8 @@ Re-read §1 and §3 if any of these become true:
    document the migration here.
 3. **Patch set grows past ~15 commits** → execute the compaction plan in §12.3
    at the next scheduled baseline rebase; do not rewrite the published branch
-   merely for cosmetic cleanup between checkpoints. (Last executed 2026-07-05:
-   17 commits → 7.)
+   merely for cosmetic cleanup between checkpoints. (Executed 2026-07-05:
+   17 commits → 7; and 2026-08-07: 15 commits → 7.)
 4. **A patch becomes irrelevant** (upstream removes the code it touches) →
    drop the patch, document the removal here.
 5. **macOS introduces a new bundle identifier convention** → revisit §5.3.
@@ -1082,6 +1082,7 @@ diff -u /tmp/zed.github.refs /tmp/zed.cnb.refs
 
 | Date       | From          | To             | Notes                                                                                                |
 | ---------- | ------------- | -------------- | ---------------------------------------------------------------------------------------------------- |
+| 2026-08-07 | `v1.14.1-pre` | `v1.15.0-pre`  | Mirrored `v1.14.2-pre`, `v1.13.2`, `v1.14.2`, and `v1.15.0-pre` (published 2026-08-02/05). Executed the §12.3 compaction on the old baseline first: **15 commits → 7**, proven tree-identical to `archive/enhanced/v1.14.1-pre-20260807-211019` — the codex elicitation auto-accept folded into patch #1, the Linux aarch64 CI job folded into the consolidated CI commit, and five per-checkpoint history commits folded into the docs commit. Rebase onto `v1.15.0-pre` applied with zero conflicts (new 1.15 line → non-linear ancestry, merge-base on upstream `main`, 96 commits behind the new tag; the 3 PREV-only commits are 1.14-branch bumps/cherry-picks). Two transient local Git faults (a lazy-blob `fetch-pack` disconnect and an `index.lock` collision that interrupted a pick mid-step, leaving the minidumper patch staged) were recovered by committing the identical staged patch with `-C` and continuing; the net fork diff stayed byte-identical at 25 files, +2924/−54. minidumper still 0.9.0 → workaround kept. Verified with `--features gpui_platform/runtime_shaders`. Release published by GitHub Actions from tag `enhanced/v1.15.0-pre`. |
 | 2026-07-30 | `v1.12.0-pre` | `v1.14.1-pre`  | Mirrored `v1.12.0`, `v1.13.0-pre`, `v1.13.1-pre`, `v1.12.1`, `v1.13.1`, and `v1.14.1-pre` (published 2026-07-23…29; upstream published no `v1.14.0-pre`). `v1.14.1-pre` is the newest release by `published_at`; new 1.14 line → non-linear ancestry (merge-base on upstream `main`, 281 commits behind the new tag) passed manual review. One conflict in patch #4: upstream switched `gpui_macos`'s `cbindgen` build-dependency to a workspace dep; kept the fork's un-gated `[build-dependencies]` without the `gpui` build-dep (fork `build.rs` reads gpui *sources* for cbindgen instead of linking it) while adopting `cbindgen.workspace = true`. Remaining 13 commits incl. the codex elicitation auto-accept applied cleanly; its unit test re-ran green. minidumper still 0.9.0 → workaround kept. Verified with `--features gpui_platform/runtime_shaders`. Release published by GitHub Actions from tag `enhanced/v1.14.1-pre`. Stack is now 15 commits — execute the §12.3 compaction at the next baseline rebase. |
 | 2026-07-18 | `v1.12.0-pre` | `v1.12.0-pre`  | Fork fix, no baseline change: extended patch #1 so enhanced YOLO also auto-accepts codex MCP tool-approval **elicitations**. The new `@agentclientprotocol/codex-acp` adapter (successor to `zed-industries/codex-acp`) forwards codex MCP tool approvals as ACP `elicitation/create` with an injected "Approval scope" `persist` select whenever the client advertises form elicitation — bypassing `session/request_permission` and therefore the existing auto-approver. Detection keys on `_meta.codex_approval_kind == "mcp_tool_call"`; answers the most persistent scope (`always` → `session` → `once`); unmarked elicitations and forms with extra required fields remain interactive. Unit test covers the adapter wire shape. Published as re-spin tag `enhanced/v1.12.0-pre.2` per §11.4. |
 | 2026-07-17 | `v1.11.3-pre` | `v1.12.0-pre`  | Mirrored `v1.11.3` and `v1.12.0-pre` (both published 2026-07-15). `v1.12.0-pre` is the newest release by `published_at`; new 1.12 minor line, so the §4.2 ancestry check was non-linear (11 PREV-only 1.11-branch bumps/cherry-picks; merge-base on upstream `main`, 150 commits behind the new tag) and passed manual review. Rebase of the 11-commit stack applied with zero conflicts; no compaction (under the §8 threshold). minidumper still 0.9.0 → workaround kept. Verified with `--features gpui_platform/runtime_shaders` (local Metal Toolchain still missing). Release build started by GitHub Actions from tag `enhanced/v1.12.0-pre`; artifacts retrieved by the operator from the published release. |
@@ -1261,15 +1262,18 @@ invariant.
 | Documentation-only pushes to `enhanced` run the current build workflow. | Operational notes have real CI cost. | Batch related documentation updates and consider a reviewed `paths-ignore` rule for `MAINTAINING.md`. |
 | The guide once called the modified bundler “unchanged” and treated an attachment variable as a tag trigger. | Operational documentation must be checked against executable files, not only earlier prose. | During each review, grep hard-coded versions/triggers and compare claims with `.cnb.yml`, workflows, and scripts. |
 
-### 12.3 Compaction plan (executed 2026-07-05; template for future runs)
+### 12.3 Compaction plan (executed 2026-07-05 and 2026-08-07; template for future runs)
 
-This plan was executed at the 2026-07-05 checkpoint (v1.9.0-pre →
-v1.10.0-pre): the 17-commit stack was rebuilt as 7 commits on the old
-baseline, proven tree-identical to the rollback tag, and only then rebased
-onto the new baseline. Keep the procedure for the next time the stack grows
-past the §8 threshold. Do not compact between checkpoints: that would create
-an extra published-history rewrite with no upstream benefit. At the next
-scheduled baseline rewrite:
+This plan has been executed twice — at the 2026-07-05 checkpoint (v1.9.0-pre →
+v1.10.0-pre, 17 commits → 7) and at the 2026-08-07 checkpoint (v1.14.1-pre →
+v1.15.0-pre, 15 commits → 7). Both times the stack was rebuilt on the **old**
+baseline, proven tree-identical to the rollback tag, and only then rebased onto
+the new baseline. Each run restores the same seven-commit shape: the five
+product patches of §3 plus one consolidated CI commit and one consolidated
+documentation commit; new work accumulates on top until the §8 threshold is
+reached again. Do not compact between checkpoints: that would create an extra
+published-history rewrite with no upstream benefit. At the next scheduled
+baseline rewrite:
 
 1. Publish the normal timestamped rollback tag to both providers first.
 2. Save the current ordered commit list and net diff, then start an interactive
