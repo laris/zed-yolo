@@ -8,6 +8,7 @@ use agent_client_protocol::schema::{
     v1::{self as acp, ErrorCode},
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
+use agent_settings::{AgentSettings, EnhancedYoloSettings};
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet};
@@ -806,12 +807,13 @@ impl AcpConnection {
     pub async fn stdio(
         agent_id: AgentId,
         project: Entity<Project>,
-        command: AgentServerCommand,
+        mut command: AgentServerCommand,
         agent_server_store: WeakEntity<AgentServerStore>,
         default_mode: Option<acp::SessionModeId>,
         default_config_options: HashMap<String, AgentConfigOptionValue>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
+        apply_enhanced_yolo_agent_env(&mut command, cx);
         let root_dir = project.read_with(cx, |project, cx| {
             project
                 .default_path_list(cx)
@@ -2670,6 +2672,63 @@ mod tests {
         });
     }
 
+    #[test]
+    fn zed_yolo_auto_accepts_codex_mcp_tool_approval_elicitations() {
+        // Wire shape produced by @agentclientprotocol/codex-acp for MCP
+        // tool-call approvals (message + injected "Approval scope" select).
+        let request_json = serde_json::json!({
+            "sessionId": "sess-1",
+            "mode": "form",
+            "message": "Allow the mcp-server-firecrawl MCP server to run tool \"firecrawl_search_feedback\"?",
+            "_meta": { "codex_approval_kind": "mcp_tool_call", "persist": ["session", "always"] },
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "persist": {
+                        "type": "string",
+                        "title": "Approval scope",
+                        "oneOf": [
+                            { "const": "once", "title": "Allow once" },
+                            { "const": "session", "title": "Allow for this session" },
+                            { "const": "always", "title": "Allow and don't ask again" }
+                        ],
+                        "default": "once"
+                    }
+                },
+                "required": ["persist"]
+            }
+        });
+        let request: acp::CreateElicitationRequest =
+            serde_json::from_value(request_json.clone()).unwrap();
+
+        let response = zed_yolo_tool_approval_elicitation_response(&request)
+            .expect("approval-shaped elicitation should be auto-accepted");
+        let expected_content = std::collections::BTreeMap::from([(
+            "persist".to_string(),
+            acp::ElicitationContentValue::from("always"),
+        )]);
+        assert_eq!(
+            response.action,
+            acp::ElicitationAction::Accept(
+                acp::ElicitationAcceptAction::new().content(expected_content)
+            )
+        );
+
+        // Without the codex approval marker this is ordinary user input and
+        // must stay interactive.
+        let mut unmarked = request_json.clone();
+        unmarked.as_object_mut().unwrap().remove("_meta");
+        let unmarked: acp::CreateElicitationRequest = serde_json::from_value(unmarked).unwrap();
+        assert!(zed_yolo_tool_approval_elicitation_response(&unmarked).is_none());
+
+        // Additional required answers cannot be guessed; fall back to the form.
+        let mut extra_required = request_json;
+        extra_required["requestedSchema"]["required"] = serde_json::json!(["persist", "reason"]);
+        let extra_required: acp::CreateElicitationRequest =
+            serde_json::from_value(extra_required).unwrap();
+        assert!(zed_yolo_tool_approval_elicitation_response(&extra_required).is_none());
+    }
+
     #[gpui::test]
     async fn client_capabilities_include_elicitation_without_acp_beta(
         cx: &mut gpui::TestAppContext,
@@ -4510,6 +4569,147 @@ fn respond_result<T: JsonRpcResponse>(responder: Responder<T>, result: Result<T,
     }
 }
 
+fn zed_yolo_env_disabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "deny" | "disabled"
+        )
+    })
+}
+
+fn zed_yolo_env_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "allow" | "enabled"
+        )
+    })
+}
+
+fn enhanced_yolo_settings(cx: &mut AsyncApp) -> EnhancedYoloSettings {
+    // Qualified instead of importing the trait: a module-level `use
+    // settings::Settings as _` reaches upstream's `mod tests` through its
+    // `use super::*` and turns upstream's own import into an unused-import warning.
+    cx.update(|cx| <AgentSettings as settings::Settings>::get_global(cx).enhanced_yolo)
+}
+
+fn zed_yolo_acp_enabled(cx: &mut AsyncApp) -> bool {
+    if zed_yolo_env_disabled("ZED_YOLO") || zed_yolo_env_disabled("ZED_YOLO_APPROVALS") {
+        return false;
+    }
+    if zed_yolo_env_enabled("ZED_YOLO") || zed_yolo_env_enabled("ZED_YOLO_APPROVALS") {
+        return true;
+    }
+
+    let settings = enhanced_yolo_settings(cx);
+    settings.enabled && settings.auto_approve_acp
+}
+
+fn apply_enhanced_yolo_agent_env(command: &mut AgentServerCommand, cx: &mut AsyncApp) {
+    let settings = enhanced_yolo_settings(cx);
+    if !settings.enabled || !settings.inject_agent_env {
+        return;
+    }
+
+    let env = command.env.get_or_insert_with(HashMap::default);
+    env.entry("ZED_YOLO".to_string())
+        .or_insert_with(|| "1".to_string());
+    env.entry("ZED_YOLO_APPROVALS".to_string())
+        .or_insert_with(|| "1".to_string());
+    if settings.disable_agent_sandbox {
+        env.entry("ZED_YOLO_SANDBOX".to_string())
+            .or_insert_with(|| "1".to_string());
+    }
+}
+
+fn zed_yolo_permission_outcome(
+    options: &[acp::PermissionOption],
+) -> Option<acp_thread::RequestPermissionOutcome> {
+    let option = options
+        .iter()
+        .find(|option| option.kind == acp::PermissionOptionKind::AllowAlways)
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| option.kind == acp::PermissionOptionKind::AllowOnce)
+        })
+        .or_else(|| {
+            options.iter().find(|option| {
+                !matches!(
+                    option.kind,
+                    acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways
+                )
+            })
+        })?;
+
+    Some(acp_thread::RequestPermissionOutcome::Selected(
+        acp_thread::SelectedPermissionOutcome::new(option.option_id.clone(), option.kind),
+    ))
+}
+
+fn zed_yolo_tool_approval_elicitation_response(
+    request: &acp::CreateElicitationRequest,
+) -> Option<acp::CreateElicitationResponse> {
+    // Codex surfaces MCP tool-call approvals as form elicitations when the
+    // client advertises elicitation support, so `session/request_permission`
+    // never fires for them. Auto-accept only requests carrying the codex ACP
+    // adapter's approval marker; every other elicitation needs real user input.
+    let meta = request.meta.as_ref()?;
+    if meta
+        .get("codex_approval_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("mcp_tool_call")
+    {
+        return None;
+    }
+
+    let acp::ElicitationMode::Form(form) = &request.mode else {
+        return None;
+    };
+    let schema = &form.requested_schema;
+
+    // The adapter injects a required `persist` select ("Approval scope") into
+    // the approval form. If codex ever requires additional answers, fall back
+    // to the interactive form instead of guessing them.
+    if schema
+        .required
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|name| name.as_str() != "persist")
+    {
+        return None;
+    }
+    let Some(acp::ElicitationPropertySchema::String(persist)) = schema.properties.get("persist")
+    else {
+        return None;
+    };
+
+    let mut candidates = Vec::new();
+    if let Some(options) = &persist.one_of {
+        candidates.extend(options.iter().map(|option| option.value.as_str()));
+    }
+    if let Some(values) = &persist.enum_values {
+        candidates.extend(values.iter().map(String::as_str));
+    }
+
+    // Mirror zed_yolo_permission_outcome: prefer the most persistent allow.
+    let value = ["always", "session", "once"]
+        .into_iter()
+        .find(|scope| candidates.contains(scope))
+        .map(str::to_owned)
+        .or_else(|| persist.default.clone())?;
+
+    let content = std::collections::BTreeMap::from([(
+        "persist".to_owned(),
+        acp::ElicitationContentValue::String(value),
+    )]);
+    Some(acp::CreateElicitationResponse::new(
+        acp::ElicitationAction::Accept(acp::ElicitationAcceptAction::new().content(content)),
+    ))
+}
+
 fn handle_request_permission(
     args: acp::RequestPermissionRequest,
     responder: Responder<acp::RequestPermissionResponse>,
@@ -4520,6 +4720,18 @@ fn handle_request_permission(
         Ok(t) => t,
         Err(e) => return respond_err(responder, e),
     };
+
+    if zed_yolo_acp_enabled(cx) {
+        if let Some(outcome) = zed_yolo_permission_outcome(&args.options) {
+            log::info!("enhanced_yolo auto-approved ACP permission request");
+            responder
+                .respond(acp::RequestPermissionResponse::new(outcome.into()))
+                .log_err();
+            return;
+        }
+
+        log::warn!("enhanced_yolo was enabled, but the ACP request had no allow option");
+    }
 
     let cancellation = responder.cancellation();
     let tool_call_id = args.tool_call.tool_call_id.clone();
@@ -4568,6 +4780,14 @@ fn handle_create_elicitation(
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
+    if zed_yolo_acp_enabled(cx) {
+        if let Some(response) = zed_yolo_tool_approval_elicitation_response(&args) {
+            log::info!("enhanced_yolo auto-accepted MCP tool approval elicitation");
+            responder.respond(response).log_err();
+            return;
+        }
+    }
+
     match args.scope() {
         acp::ElicitationScope::Session(scope) => {
             let thread = match session_thread(ctx, &scope.session_id) {

@@ -1235,6 +1235,21 @@
         // },
       },
     },
+    // Enhanced fork controls for coding-agent ACP approval behavior.
+    //
+    // "enabled" is the master switch.
+    // "auto_approve_acp" makes Zed select an allow option for ACP permission
+    // prompts without opening a dialog.
+    // "inject_agent_env" forwards ZED_YOLO/ZED_YOLO_APPROVALS into every ACP
+    // agent process, including remote project launches.
+    // "disable_agent_sandbox" also forwards ZED_YOLO_SANDBOX=1 for adapters
+    // that support disabling their execution sandbox. It is off by default.
+    "enhanced_yolo": {
+      "enabled": true,
+      "auto_approve_acp": true,
+      "inject_agent_env": true,
+      "disable_agent_sandbox": false,
+    },
     // When enabled, agent edits will be displayed in single-file editors for review
     "single_file_review": false,
     // Settings for automatic agent context compaction, which summarizes earlier

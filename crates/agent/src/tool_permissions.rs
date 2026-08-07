@@ -561,7 +561,9 @@ mod tests {
     use crate::pattern_extraction::extract_terminal_pattern;
     use crate::tools::{DeletePathTool, FetchTool, TerminalTool};
     use crate::{AgentTool, EditFileTool};
-    use agent_settings::{AgentProfileId, CompiledRegex, InvalidRegexPattern, ToolRules};
+    use agent_settings::{
+        AgentProfileId, CompiledRegex, EnhancedYoloSettings, InvalidRegexPattern, ToolRules,
+    };
     use gpui::px;
     use settings::{DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone};
     use std::sync::Arc;
@@ -609,6 +611,12 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            enhanced_yolo: EnhancedYoloSettings {
+                enabled: true,
+                auto_approve_acp: true,
+                inject_agent_env: true,
+                disable_agent_sandbox: false,
+            },
         }
     }
 

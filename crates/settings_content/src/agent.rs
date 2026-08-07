@@ -357,6 +357,12 @@ pub struct AgentSettingsContent {
     /// These are populated when choosing "Allow always" from a sandbox
     /// escalation prompt.
     pub sandbox_permissions: Option<SandboxPermissionsContent>,
+
+    /// Enhanced fork controls for ACP agent approval behavior.
+    ///
+    /// Default: enabled, auto-approve ACP requests, inject YOLO env into
+    /// agent launches, keep the agent sandbox enabled.
+    pub enhanced_yolo: Option<EnhancedYoloSettingsContent>,
 }
 
 impl AgentSettingsContent {
@@ -955,6 +961,30 @@ pub struct SandboxPermissionsContent {
     /// that must be acknowledged before the command runs.
     /// Default: true
     pub warn_ntfs_grants: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct EnhancedYoloSettingsContent {
+    /// Master switch for the enhanced YOLO policy.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// Auto-select an allow option for ACP `RequestPermission` prompts.
+    ///
+    /// Default: true
+    pub auto_approve_acp: Option<bool>,
+    /// Inject `ZED_YOLO` / `ZED_YOLO_APPROVALS` into ACP agent processes.
+    /// This applies to both local and remote projects because Zed forwards
+    /// the command environment across the remote command boundary.
+    ///
+    /// Default: true
+    pub inject_agent_env: Option<bool>,
+    /// Also inject `ZED_YOLO_SANDBOX=1` for adapters that support disabling
+    /// their execution sandbox. This is intentionally off by default.
+    ///
+    /// Default: false
+    pub disable_agent_sandbox: Option<bool>,
 }
 
 #[with_fallible_options]
