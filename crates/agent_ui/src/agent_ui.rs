@@ -947,7 +947,7 @@ fn update_active_language_model_from_settings(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_settings::{AgentProfileId, AgentSettings};
+    use agent_settings::{AgentProfileId, AgentSettings, EnhancedYoloSettings};
     use command_palette_hooks::CommandPaletteFilter;
     use db::kvp::KeyValueStore;
     use editor::actions::AcceptEditPrediction;
@@ -1011,6 +1011,12 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            enhanced_yolo: EnhancedYoloSettings {
+                enabled: true,
+                auto_approve_acp: true,
+                inject_agent_env: true,
+                disable_agent_sandbox: false,
+            },
         };
 
         cx.update(|cx| {
