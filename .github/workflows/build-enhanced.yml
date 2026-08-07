@@ -1,0 +1,286 @@
+name: Build enhanced
+
+on:
+  push:
+    branches: [enhanced]
+    tags: ['enhanced/v*']
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Build profile
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - dev
+
+concurrency:
+  group: build-enhanced-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle_mac_aarch64:
+    runs-on: macos-latest
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+      ZED_BUNDLE: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain & host
+        run: |
+          rustc -Vv
+          cargo -V
+          sw_vers
+          uname -m
+
+      - name: Add Rust target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: mac-aarch64-${{ github.event.inputs.profile || 'release' }}
+          cache-on-failure: 'true'
+
+      - name: Setup Node (for dmg-license)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dmg-license
+        run: npm install --global dmg-license minimist
+
+      - name: Bundle .app + remote_server
+        id: bundle
+        run: |
+          set -euo pipefail
+          PROFILE="${{ github.event.inputs.profile || 'release' }}"
+          if [ "$PROFILE" = "dev" ]; then
+            ./script/bundle-mac -d aarch64-apple-darwin
+            echo "app_path=target/aarch64-apple-darwin/debug/bundle/osx/Zed Preview.app" >> "$GITHUB_OUTPUT"
+            echo "dmg_path=" >> "$GITHUB_OUTPUT"
+          else
+            ./script/bundle-mac aarch64-apple-darwin
+            echo "app_path=target/aarch64-apple-darwin/release/dmg/Zed Preview.app" >> "$GITHUB_OUTPUT"
+            echo "dmg_path=target/aarch64-apple-darwin/release/Zed-aarch64.dmg" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify bundle
+        run: |
+          APP="${{ steps.bundle.outputs.app_path }}"
+          test -d "$APP"
+          file "$APP/Contents/MacOS/zed"
+          codesign -dvv "$APP" 2>&1 | head -7
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist"
+          du -sh "$APP"
+
+      - name: Tar .app
+        id: tar
+        run: |
+          set -euo pipefail
+          APP="${{ steps.bundle.outputs.app_path }}"
+          PROFILE="${{ github.event.inputs.profile || 'release' }}"
+          OUT="Zed-Preview-aarch64-${PROFILE}.tar.gz"
+          tar -C "$(dirname "$APP")" -czf "$OUT" "$(basename "$APP")"
+          shasum -a 256 "$OUT" > "$OUT.sha256"
+          ls -lh "$OUT"
+          echo "app_tar=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .app tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-preview-aarch64-${{ github.event.inputs.profile || 'release' }}-app
+          path: |
+            Zed-Preview-aarch64-*.tar.gz
+            Zed-Preview-aarch64-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload DMG
+        if: ${{ steps.bundle.outputs.dmg_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-preview-aarch64-${{ github.event.inputs.profile || 'release' }}-dmg
+          path: ${{ steps.bundle.outputs.dmg_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload macOS remote-server
+        if: ${{ github.event.inputs.profile != 'dev' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-remote-server-macos-aarch64-gz
+          path: target/zed-remote-server-macos-aarch64.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle_linux_remote_server_x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools clang
+
+      - name: Add Rust target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64-musl-remote-server
+          cache-on-failure: 'true'
+
+      - name: Build remote_server (musl, static)
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl --package remote_server
+          ls -lh target/x86_64-unknown-linux-musl/release/remote_server
+
+      - name: Strip & gzip
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-unknown-linux-musl/release/remote_server
+          strip "$BIN"
+          gzip -f --stdout --best "$BIN" > zed-remote-server-linux-x86_64.gz
+          shasum -a 256 zed-remote-server-linux-x86_64.gz > zed-remote-server-linux-x86_64.gz.sha256
+          ls -lh zed-remote-server-linux-x86_64.gz
+
+      - name: Upload Linux remote-server
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-remote-server-linux-x86_64-gz
+          path: |
+            zed-remote-server-linux-x86_64.gz
+            zed-remote-server-linux-x86_64.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle_linux_remote_server_aarch64:
+    # GitHub-hosted arm64 runners are free for public repositories.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools clang
+
+      - name: Add Rust target
+        run: rustup target add aarch64-unknown-linux-musl
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-aarch64-musl-remote-server
+          cache-on-failure: 'true'
+
+      - name: Build remote_server (musl, static)
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl --package remote_server
+          ls -lh target/aarch64-unknown-linux-musl/release/remote_server
+
+      - name: Strip & gzip
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-unknown-linux-musl/release/remote_server
+          strip "$BIN"
+          gzip -f --stdout --best "$BIN" > zed-remote-server-linux-aarch64.gz
+          shasum -a 256 zed-remote-server-linux-aarch64.gz > zed-remote-server-linux-aarch64.gz.sha256
+          ls -lh zed-remote-server-linux-aarch64.gz
+
+      - name: Upload Linux remote-server
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-remote-server-linux-aarch64-gz
+          path: |
+            zed-remote-server-linux-aarch64.gz
+            zed-remote-server-linux-aarch64.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish_release:
+    # Only publish on enhanced/v* tag push, never on branch push or workflow_dispatch.
+    if: startsWith(github.ref, 'refs/tags/enhanced/v')
+    needs:
+      - bundle_mac_aarch64
+      - bundle_linux_remote_server_x86_64
+      - bundle_linux_remote_server_aarch64
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: List artifacts
+        run: ls -lR ./artifacts
+
+      - name: Stage release files
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # macOS .app tarball + checksum
+          cp ./artifacts/zed-preview-aarch64-release-app/Zed-Preview-aarch64-release.tar.gz       release/Zed-Preview-aarch64.tar.gz
+          cp ./artifacts/zed-preview-aarch64-release-app/Zed-Preview-aarch64-release.tar.gz.sha256 release/Zed-Preview-aarch64.tar.gz.sha256
+          # macOS .dmg
+          cp ./artifacts/zed-preview-aarch64-release-dmg/Zed-aarch64.dmg                          release/Zed-aarch64.dmg
+          # macOS remote-server
+          cp ./artifacts/zed-remote-server-macos-aarch64-gz/zed-remote-server-macos-aarch64.gz    release/zed-remote-server-macos-aarch64.gz
+          # Linux remote-servers + checksums
+          cp ./artifacts/zed-remote-server-linux-x86_64-gz/zed-remote-server-linux-x86_64.gz        release/zed-remote-server-linux-x86_64.gz
+          cp ./artifacts/zed-remote-server-linux-x86_64-gz/zed-remote-server-linux-x86_64.gz.sha256 release/zed-remote-server-linux-x86_64.gz.sha256
+          cp ./artifacts/zed-remote-server-linux-aarch64-gz/zed-remote-server-linux-aarch64.gz        release/zed-remote-server-linux-aarch64.gz
+          cp ./artifacts/zed-remote-server-linux-aarch64-gz/zed-remote-server-linux-aarch64.gz.sha256 release/zed-remote-server-linux-aarch64.gz.sha256
+          ls -lh release
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Preview baselines and their immutable re-spins are prereleases.
+          # Final upstream baselines such as enhanced/v1.8.2 are not.
+          PRE_FLAG=""
+          if [[ "$TAG" == *-pre || "$TAG" == *-pre.* ]]; then
+            PRE_FLAG="--prerelease"
+          fi
+          # Fail loudly if the release already exists (per MAINTAINING.md §11).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists. Keep it immutable and publish a new re-spin tag."
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            $PRE_FLAG \
+            release/*
