@@ -115,8 +115,11 @@ build() {
   TARGET="$1"
   local label="$2"
   shift 2
+  # No Linux host has Apple's `metal` compiler, so every Darwin artifact,
+  # including remote_server (which links gpui_platform), must compile shaders
+  # at runtime. bundle-mac makes the same choice for Metal-less macOS hosts.
   local feature_args=()
-  if [[ "$label" == "zed-cli" || "$label" == "all" ]]; then
+  if [[ "$TARGET" == *apple-darwin ]]; then
     feature_args=(--features gpui_platform/runtime_shaders)
   fi
   mkdir -p dist
@@ -124,10 +127,22 @@ build() {
     date +%s > "dist/${TARGET}.start"
   fi
   rustup target add "$TARGET"
+  # Darwin targets link with clang + ld64.lld through the
+  # aarch64-apple-darwin-clang wrappers selected by the container's CC_/LINKER
+  # environment (zig's Mach-O linker lacks section$start/end symbols before 0.14
+  # and zig >= 0.14 needs statx(2), which old build-host kernels lack). Linux
+  # targets keep cargo-zigbuild for glibc-version pinning.
+  local cargo_build=(cargo build)
+  if [[ "$TARGET" != *apple-darwin ]]; then
+    cargo_build=(cargo zigbuild)
+  fi
+  # .cargo/bundle-config.toml is what upstream's bundle scripts pass, so the
+  # cross-built binaries get the same share-generics codegen as native bundles.
   run_with_progress "${TARGET}-${label}" \
-    /usr/bin/time -v cargo zigbuild --locked --release \
+    /usr/bin/time -v "${cargo_build[@]}" --locked --release \
+      --config .cargo/bundle-config.toml \
       --target "$TARGET" \
-      "${feature_args[@]}" \
+      ${feature_args[@]+"${feature_args[@]}"} \
       "$@"
 }
 
@@ -201,7 +216,7 @@ package_target() {
   local binaries_csv
   binaries_csv=$(IFS=,; printf '%s' "${binaries[*]}")
   printf '{"package":"zed-yolo","version":"%s","target":"%s","filename":"%s","sha256":"%s","seconds":%s,"commit":"%s","build":"%s","date":"%s","runtime_shaders":%s,"binaries":"%s","runner_cpus":"%s","runner_memory_gib":"%s","cargo_build_jobs":"%s","benchmark":"%s"}\n' \
-    "$VERSION" "$TARGET" "$(basename "$tarball")" "$sha" "$((end - start))" "$CNB_COMMIT" "$CNB_BUILD_ID" "$BUILD_DATE" \
+    "$VERSION" "$TARGET" "$(basename "$tarball")" "$sha" "$((end - start))" "${CNB_COMMIT:-$(git rev-parse HEAD)}" "${CNB_BUILD_ID:-local}" "$BUILD_DATE" \
     "$runtime_shaders" "$binaries_csv" \
     "${ZED_YOLO_RUNNER_CPUS:-unknown}" "${ZED_YOLO_RUNNER_MEMORY_GIB:-unknown}" "${CARGO_BUILD_JOBS:-default}" "${ZED_YOLO_BENCHMARK:-default}" \
     | tee "$tarball.build.json"
@@ -217,17 +232,15 @@ int main(void) {
   return 0;
 }
 EOF
+  # Same wrapper cargo uses for the real link; duplicate -l/-framework flags
+  # mirror what rustc emits and must collapse to one load command each.
   run_with_progress "macho-linker-dedupe-smoke" \
-    zig cc \
-      -target aarch64-macos \
-      -isysroot "$SDKROOT" \
-      -L "$SDKROOT/usr/lib" \
-      -F "$SDKROOT/System/Library/Frameworks" \
-      -mmacosx-version-min=13.0 \
+    aarch64-apple-darwin-clang \
       "$smoke_dir/objc_smoke.c" \
       -lobjc -l objc \
       -liconv -l iconv \
       -framework AppKit -framework Appkit -framework AppKit \
+      -Wl,-ObjC -Wl,-weak_framework,ScreenCaptureKit -Wl,-dead_strip \
       -o "$smoke_dir/objc_smoke"
   file "$smoke_dir/objc_smoke"
   python3 script/check-macho-dylibs.py "$smoke_dir/objc_smoke"

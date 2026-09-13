@@ -23,7 +23,9 @@ fn main() {
         }
     }
 
-    if cfg!(target_os = "macos") {
+    // `cfg!(target_os)` in a build script describes the host, which would drop
+    // these link arguments when cross-compiling for macOS from a Linux host.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET=10.15.7");
 
         // Weakly link ReplayKit to ensure Zed can be used on macOS 10.15+.

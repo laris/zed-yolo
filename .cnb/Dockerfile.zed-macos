@@ -1,7 +1,10 @@
 FROM ghcr.io/rust-cross/cargo-zigbuild:latest
 
-ARG MACOS_SDK_VERSION=15.5
-ARG MACOS_SDK_SHA256=c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
+# SDK 26 is required so the cross-build sets `macos_sdk_26_or_later` (see
+# crates/ui/build.rs); it decides the title-bar traffic-light padding on
+# macOS 26 hosts. Checksum from the release's sha256sum.txt.
+ARG MACOS_SDK_VERSION=26.1
+ARG MACOS_SDK_SHA256=beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c
 
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
@@ -40,8 +43,8 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
-    rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy --component rust-src; \
-    rustup default 1.94.1; \
+    rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy --component rust-src; \
+    rustup default 1.97.1; \
     rustup target add \
       wasm32-wasip2 \
       wasm32-unknown-unknown \
@@ -75,22 +78,103 @@ RUN set -eux; \
     test -e "$framework_dir/Appkit.framework/Appkit.tbd"; \
     printf 'SDKROOT=%s\n' "$SDKROOT"
 
+# Minimal xcrun stand-in: answers the two SDK queries that Zed build scripts
+# make (media, ui) from $SDKROOT and fails for everything else, so
+# `xcrun --find metal` keeps selecting runtime shader compilation.
 RUN set -eux; \
     printf '%s\n' \
       '#!/bin/sh' \
-      'if [ "$1" = "--sdk" ] && [ "$3" = "--show-sdk-path" ]; then' \
-      '  case "$2" in' \
-      '    macosx) test -n "${SDKROOT:-}" && printf "%s\n" "$SDKROOT" && exit 0 ;;' \
+      'if [ "$1" = "--sdk" ] && [ "$2" = "macosx" ] && [ -n "${SDKROOT:-}" ]; then' \
+      '  case "$3" in' \
+      '    --show-sdk-path) printf "%s\n" "$SDKROOT" && exit 0 ;;' \
+      '    --show-sdk-version) jq -r .Version "$SDKROOT/SDKSettings.json" && exit 0 ;;' \
       '  esac' \
       'fi' \
       'echo "unsupported xcrun shim invocation: $*" >&2' \
       'exit 127' \
       > /usr/local/bin/xcrun; \
-    chmod +x /usr/local/bin/xcrun
+    chmod +x /usr/local/bin/xcrun; \
+    SDKROOT="$SDKROOT" xcrun --sdk macosx --show-sdk-version
 
 RUN set -eux; \
     cargo install cargo-about --version 0.8.2 --locked; \
     cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+
+# Darwin targets compile and link with Debian's clang + LLVM's ld64.lld instead
+# of zig: zig's Mach-O linker only gained the section$start/end symbols that
+# the `ctor` crate needs in 0.14, and zig >= 0.14 requires statx(2) (kernel
+# >= 4.11) for its cache, which rules out the CentOS 7 build hosts we use.
+# clang/lld are glibc binaries and run on any kernel the image itself runs on.
+# -mcpu=apple-m1 matches rustc's target CPU (aws-lc-sys requires the AES/SHA2
+# feature bits statically); -Wno-elaborated-enum-base keeps the SDK's
+# CF_ENUM/CV_ENUM macros compiling in C++ with non-Apple clang.
+#
+# clang links the Darwin compiler-rt builtins (`__isPlatformVersionAtLeast`
+# behind every `@available` check, e.g. in webrtc-sys' Objective-C++) only when
+# libclang_rt.osx.a exists in its resource dir. Apple's archive cannot ship in
+# this image, so the resource-dir entry is a symlink to a mount point that
+# .cnb/cross-build-macos.sh bind-mounts from the host (see its
+# ZED_CROSS_COMPILER_RT); a dangling link keeps plain compiles working.
+RUN set -eux; \
+    llvm_bin="$(clang -print-resource-dir | sed 's#/lib/clang/.*##')/bin"; \
+    for tool in ar ranlib strip nm objcopy lipo install-name-tool; do \
+      ln -sf "$llvm_bin/llvm-$tool" "/usr/local/bin/llvm-$tool"; \
+    done; \
+    ln -sf "$llvm_bin/ld64.lld" /usr/local/bin/ld64.lld; \
+    resource_dir="$(clang -print-resource-dir)"; \
+    mkdir -p "$resource_dir/lib/darwin" /opt/compiler-rt; \
+    ln -sf /opt/compiler-rt/libclang_rt.osx.a "$resource_dir/lib/darwin/libclang_rt.osx.a"; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# clang + ld64.lld driver for aarch64-apple-darwin, used as the Rust' \
+      '# linker and as cc-rs CC/CXX. Also invoked as aarch64-apple-darwin-clang++.' \
+      'set -eu' \
+      'compiler=clang' \
+      'case "$0" in' \
+      '  *++) compiler=clang++; set -- -stdlib=libc++ -Wno-elaborated-enum-base "$@" ;;' \
+      'esac' \
+      '# rustc passes -nodefaultlibs, which stops clang from adding the Darwin' \
+      '# compiler-rt builtins (__isPlatformVersionAtLeast); append the archive the' \
+      '# host mounted (see Dockerfile) on link steps only.' \
+      'link=1' \
+      'for arg in "$@"; do' \
+      '  case "$arg" in' \
+      '    -c|-S|-E|-M|-MM|-fsyntax-only|--version|-v|-dumpmachine|-print-*|-###) link=0 ;;' \
+      '  esac' \
+      'done' \
+      'if [ "$link" = 1 ] && [ -f /opt/compiler-rt/libclang_rt.osx.a ]; then' \
+      '  set -- "$@" /opt/compiler-rt/libclang_rt.osx.a' \
+      'fi' \
+      '# ld64.lld only inserts arm64 branch-range thunks inside __TEXT,__text.' \
+      '# zed'"'"'s __text exceeds the 128 MiB bl reach, so the `ctor` constructors' \
+      '# (placed in __TEXT,__text_startup) must be folded into __text to link.' \
+      'if [ "$link" = 1 ]; then' \
+      '  set -- "$@" -Wl,-rename_section,__TEXT,__text_startup,__TEXT,__text' \
+      'fi' \
+      'exec "$compiler" \' \
+      '  --target=arm64-apple-macos \' \
+      '  "-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET:-10.15.7}" \' \
+      '  -isysroot "$SDKROOT" \' \
+      '  "-F$SDKROOT/System/Library/Frameworks" \' \
+      '  -mcpu=apple-m1 \' \
+      '  -fuse-ld=lld \' \
+      '  -Wno-unused-command-line-argument \' \
+      '  "$@"' \
+      > /usr/local/bin/aarch64-apple-darwin-clang; \
+    chmod +x /usr/local/bin/aarch64-apple-darwin-clang; \
+    ln -sf aarch64-apple-darwin-clang /usr/local/bin/aarch64-apple-darwin-clang++; \
+    printf 'int main(void) { return 0; }\n' > /tmp/toolchain-smoke.c; \
+    aarch64-apple-darwin-clang /tmp/toolchain-smoke.c -framework CoreFoundation -lobjc -Wl,-ObjC -Wl,-dead_strip -o /tmp/toolchain-smoke; \
+    file /tmp/toolchain-smoke | grep -q 'Mach-O 64-bit arm64'; \
+    printf '#include <string>\nint main() { std::string s; return (int)s.size(); }\n' > /tmp/toolchain-smoke.cpp; \
+    aarch64-apple-darwin-clang++ -std=c++20 -c /tmp/toolchain-smoke.cpp -o /tmp/toolchain-smoke.o; \
+    rm -f /tmp/toolchain-smoke*
+
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=aarch64-apple-darwin-clang \
+    CC_aarch64_apple_darwin=aarch64-apple-darwin-clang \
+    CXX_aarch64_apple_darwin=aarch64-apple-darwin-clang++ \
+    AR_aarch64_apple_darwin=llvm-ar \
+    RANLIB_aarch64_apple_darwin=llvm-ranlib
 
 RUN set -eux; \
     real_zig="$(command -v zig)"; \

@@ -53,6 +53,7 @@ $:
             free -h
             cargo zigbuild --help >/dev/null
             zig version
+            aarch64-apple-darwin-clang --version | head -n 1
             printf 'SDKROOT=%s\n' "${SDKROOT:-}"
             test -n "${SDKROOT:-}"
             test -d "$SDKROOT"
