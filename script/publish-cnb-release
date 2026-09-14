@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Create the CNB release for a tag (if missing) and upload assets to it.
+#
+# usage: script/publish-cnb-release [--repo GROUP/NAME] [--name TITLE]
+#                                   [--body TEXT] --tag TAG FILE...
+#
+# Every API call goes through the official `cnb` CLI, so authentication is
+# its business: on a Mac it holds the login token in the keyring, inside a
+# CNB pipeline it reads CNB_TOKEN. Only the pre-signed asset PUT uses curl.
+# CNB traffic never uses the workstation proxy. Existing assets with the same
+# name are overwritten, so re-running after a partial upload is safe.
+set -euo pipefail
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+export NO_PROXY='*' no_proxy='*'
+
+repo=${CNB_REPO_SLUG:-lary.me/zed-yolo}
+tag=""
+name=""
+body=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo=$2; shift 2 ;;
+    --tag) tag=$2; shift 2 ;;
+    --name) name=$2; shift 2 ;;
+    --body) body=$2; shift 2 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+test -n "$tag" || { echo "--tag is required" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "no files to upload" >&2; exit 2; }
+for file in "$@"; do test -f "$file" || { echo "missing file: $file" >&2; exit 1; }; done
+
+cnb_bin=${CNB_BIN:-cnb}
+if ! command -v "$cnb_bin" >/dev/null; then
+  if [ -x "$HOME/.local/bin/cnb" ]; then cnb_bin="$HOME/.local/bin/cnb"; else
+    echo "cnb CLI not found; install with: npm install -g @cnbcool/cnb-cli" >&2; exit 127
+  fi
+fi
+# -v makes the CLI print the raw JSON response.
+api() { "$cnb_bin" "$@" -v; }
+
+release_json=$(api releases get-release-by-tag --repo "$repo" --tag "$tag" 2>/dev/null || true)
+release_id=$(printf '%s' "$release_json" | jq -r '.data.id // empty' 2>/dev/null || true)
+if [ -z "$release_id" ]; then
+  prerelease=()
+  case "$tag" in *-pre*) prerelease=(--prerelease) ;; esac
+  release_json=$(api releases post-release --repo "$repo" --tag-name "$tag" --name "${name:-$tag}" \
+    ${body:+--body "$body"} ${prerelease[@]+"${prerelease[@]}"})
+  release_id=$(printf '%s' "$release_json" | jq -r '.data.id // empty')
+  test -n "$release_id" || { echo "could not create release $tag:" >&2; printf '%s\n' "$release_json" >&2; exit 1; }
+  echo "created release $tag (id $release_id) in $repo"
+else
+  echo "release $tag exists (id $release_id) in $repo"
+fi
+
+for file in "$@"; do
+  asset=$(basename "$file")
+  size=$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file")
+  ticket=$(api releases post-release-asset-upload-url --repo "$repo" --release-id "$release_id" \
+    --asset-name "$asset" --size "$size" --overwrite)
+  upload_url=$(printf '%s' "$ticket" | jq -r '.data.upload_url // empty')
+  verify_url=$(printf '%s' "$ticket" | jq -r '.data.verify_url // empty')
+  if [ -z "$upload_url" ] || [ -z "$verify_url" ]; then
+    echo "no upload ticket for $asset:" >&2; printf '%s\n' "$ticket" >&2; exit 1
+  fi
+  # verify_url ends in .../asset-upload-confirmation/<upload_token>/<asset_path>
+  upload_token=$(printf '%s' "$verify_url" | sed -E 's#.*/asset-upload-confirmation/([^/]+)/.*#\1#')
+  asset_path=$(printf '%s' "$verify_url" | sed -E 's#.*/asset-upload-confirmation/[^/]+/(.*)#\1#')
+  curl -fsS -X PUT -H 'Content-Type: application/octet-stream' --upload-file "$file" "$upload_url" >/dev/null
+  api releases post-release-asset-upload-confirmation --repo "$repo" --release-id "$release_id" \
+    --upload-token "$upload_token" --asset-path "$asset_path" >/dev/null
+  echo "uploaded $asset ($size bytes)"
+done
+
+echo "assets of $tag:"
+api releases get-release-by-tag --repo "$repo" --tag "$tag" | jq -r '.data.assets[]? | "  \(.name)\t\(.size // "")"'

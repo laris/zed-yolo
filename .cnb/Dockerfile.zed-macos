@@ -1,0 +1,289 @@
+FROM ghcr.io/rust-cross/cargo-zigbuild:latest
+
+# SDK 26 is required so the cross-build sets `macos_sdk_26_or_later` (see
+# crates/ui/build.rs); it decides the title-bar traffic-light padding on
+# macOS 26 hosts. Checksum from the release's sha256sum.txt.
+ARG MACOS_SDK_VERSION=26.1
+ARG MACOS_SDK_SHA256=beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c
+
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_INCREMENTAL=0
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/var/cache/sccache
+ENV SCCACHE_CACHE_SIZE=80G
+ENV SDKROOT=/opt/MacOSX${MACOS_SDK_VERSION}.sdk
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      clang \
+      cmake \
+      curl \
+      file \
+      git \
+      jq \
+      libclang-dev \
+      libprotobuf-dev \
+      libssl-dev \
+      lld \
+      mold \
+      nodejs \
+      npm \
+      pkg-config \
+      protobuf-compiler \
+      python3 \
+      sccache \
+      time \
+      xz-utils \
+      zip \
+      zstd; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy --component rust-src; \
+    rustup default 1.97.1; \
+    rustup target add \
+      wasm32-wasip2 \
+      wasm32-unknown-unknown \
+      x86_64-unknown-linux-musl \
+      aarch64-unknown-linux-musl \
+      aarch64-apple-darwin \
+      x86_64-apple-darwin; \
+    cargo zigbuild --help >/dev/null; \
+    zig version
+
+RUN set -eux; \
+    sdk_archive="/tmp/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"; \
+    curl -fsSL \
+      -o "$sdk_archive" \
+      "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"; \
+    printf '%s  %s\n' "$MACOS_SDK_SHA256" "$sdk_archive" | sha256sum -c -; \
+    rm -rf "$SDKROOT"; \
+    tar -xJf "$sdk_archive" -C /opt; \
+    rm -f "$sdk_archive"; \
+    test -d "$SDKROOT"; \
+    test -d "$SDKROOT/System/Library/Frameworks/ScreenCaptureKit.framework"; \
+    framework_dir="$SDKROOT/System/Library/Frameworks"; \
+    ln -sfn AppKit.framework "$framework_dir/Appkit.framework"; \
+    if [ -e "$framework_dir/AppKit.framework/AppKit.tbd" ] && [ ! -e "$framework_dir/AppKit.framework/Appkit.tbd" ]; then \
+      ln -s AppKit.tbd "$framework_dir/AppKit.framework/Appkit.tbd"; \
+    fi; \
+    if [ -e "$framework_dir/AppKit.framework/AppKit" ] && [ ! -e "$framework_dir/AppKit.framework/Appkit" ]; then \
+      ln -s AppKit "$framework_dir/AppKit.framework/Appkit"; \
+    fi; \
+    printf '!<arch>\n' > "$SDKROOT/usr/lib/libclang_rt.osx.a"; \
+    test -e "$SDKROOT/usr/lib/libclang_rt.osx.a"; \
+    test -e "$framework_dir/Appkit.framework/Appkit.tbd"; \
+    printf 'SDKROOT=%s\n' "$SDKROOT"
+
+# Minimal xcrun stand-in: answers the two SDK queries that Zed build scripts
+# make (media, ui) from $SDKROOT and fails for everything else, so
+# `xcrun --find metal` keeps selecting runtime shader compilation.
+RUN set -eux; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'if [ "$1" = "--sdk" ] && [ "$2" = "macosx" ] && [ -n "${SDKROOT:-}" ]; then' \
+      '  case "$3" in' \
+      '    --show-sdk-path) printf "%s\n" "$SDKROOT" && exit 0 ;;' \
+      '    --show-sdk-version) jq -r .Version "$SDKROOT/SDKSettings.json" && exit 0 ;;' \
+      '  esac' \
+      'fi' \
+      'echo "unsupported xcrun shim invocation: $*" >&2' \
+      'exit 127' \
+      > /usr/local/bin/xcrun; \
+    chmod +x /usr/local/bin/xcrun; \
+    SDKROOT="$SDKROOT" xcrun --sdk macosx --show-sdk-version
+
+RUN set -eux; \
+    cargo install cargo-about --version 0.8.2 --locked; \
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+
+# The official CNB client publishes stage-1 assets to the tag's CNB release
+# from inside a pipeline (script/publish-cnb-release reads CNB_TOKEN).
+RUN set -eux; \
+    npm install -g @cnbcool/cnb-cli; \
+    cnb --help >/dev/null
+
+# Darwin targets compile and link with Debian's clang + LLVM's ld64.lld instead
+# of zig: zig's Mach-O linker only gained the section$start/end symbols that
+# the `ctor` crate needs in 0.14, and zig >= 0.14 requires statx(2) (kernel
+# >= 4.11) for its cache, which rules out the CentOS 7 build hosts we use.
+# clang/lld are glibc binaries and run on any kernel the image itself runs on.
+# -mcpu=apple-m1 matches rustc's target CPU (aws-lc-sys requires the AES/SHA2
+# feature bits statically); -Wno-elaborated-enum-base keeps the SDK's
+# CF_ENUM/CV_ENUM macros compiling in C++ with non-Apple clang.
+#
+# rustc passes -nodefaultlibs, so the wrapper has to append the Darwin
+# compiler-rt builtins (`__isPlatformVersionAtLeast` behind every `@available`
+# check, e.g. in webrtc-sys' Objective-C++) itself. It prefers Apple's archive
+# when .cnb/cross-build-macos.sh bind-mounts one at /opt/compiler-rt (see its
+# ZED_CROSS_COMPILER_RT) and otherwise uses the archive built from LLVM's
+# source further below.
+RUN set -eux; \
+    llvm_bin="$(clang -print-resource-dir | sed 's#/lib/clang/.*##')/bin"; \
+    for tool in ar ranlib strip nm objcopy lipo install-name-tool; do \
+      ln -sf "$llvm_bin/llvm-$tool" "/usr/local/bin/llvm-$tool"; \
+    done; \
+    ln -sf "$llvm_bin/ld64.lld" /usr/local/bin/ld64.lld; \
+    mkdir -p "$(clang -print-resource-dir)/lib/darwin" /opt/compiler-rt; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# clang + ld64.lld driver for aarch64-apple-darwin, used as the Rust' \
+      '# linker and as cc-rs CC/CXX. Also invoked as aarch64-apple-darwin-clang++.' \
+      'set -eu' \
+      'compiler=clang' \
+      'case "$0" in' \
+      '  *++) compiler=clang++; set -- -stdlib=libc++ -Wno-elaborated-enum-base "$@" ;;' \
+      'esac' \
+      '# rustc passes -nodefaultlibs, which stops clang from adding the Darwin' \
+      '# compiler-rt builtins (__isPlatformVersionAtLeast). On link steps append' \
+      '# the archive the host mounted, else the one built from LLVM source.' \
+      'link=1' \
+      'for arg in "$@"; do' \
+      '  case "$arg" in' \
+      '    -c|-S|-E|-M|-MM|-fsyntax-only|--version|-v|-dumpmachine|-print-*|-###) link=0 ;;' \
+      '  esac' \
+      'done' \
+      'if [ "$link" = 1 ]; then' \
+      '  rt=/opt/compiler-rt/libclang_rt.osx.a' \
+      '  [ -f "$rt" ] || rt="$(clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"' \
+      '  [ -f "$rt" ] && set -- "$@" "$rt"' \
+      'fi' \
+      '# ld64.lld only inserts arm64 branch-range thunks inside __TEXT,__text.' \
+      '# zed'"'"'s __text exceeds the 128 MiB bl reach, so the `ctor` constructors' \
+      '# (placed in __TEXT,__text_startup) must be folded into __text to link.' \
+      'if [ "$link" = 1 ]; then' \
+      '  set -- "$@" -Wl,-rename_section,__TEXT,__text_startup,__TEXT,__text' \
+      'fi' \
+      'exec "$compiler" \' \
+      '  --target=arm64-apple-macos \' \
+      '  "-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET:-10.15.7}" \' \
+      '  -isysroot "$SDKROOT" \' \
+      '  "-F$SDKROOT/System/Library/Frameworks" \' \
+      '  -mcpu=apple-m1 \' \
+      '  -fuse-ld=lld \' \
+      '  -Wno-unused-command-line-argument \' \
+      '  "$@"' \
+      > /usr/local/bin/aarch64-apple-darwin-clang; \
+    chmod +x /usr/local/bin/aarch64-apple-darwin-clang; \
+    ln -sf aarch64-apple-darwin-clang /usr/local/bin/aarch64-apple-darwin-clang++; \
+    printf 'int main(void) { return 0; }\n' > /tmp/toolchain-smoke.c; \
+    aarch64-apple-darwin-clang /tmp/toolchain-smoke.c -framework CoreFoundation -lobjc -Wl,-ObjC -Wl,-dead_strip -o /tmp/toolchain-smoke; \
+    file /tmp/toolchain-smoke | grep -q 'Mach-O 64-bit arm64'; \
+    printf '#include <string>\nint main() { std::string s; return (int)s.size(); }\n' > /tmp/toolchain-smoke.cpp; \
+    aarch64-apple-darwin-clang++ -std=c++20 -c /tmp/toolchain-smoke.cpp -o /tmp/toolchain-smoke.o; \
+    rm -f /tmp/toolchain-smoke*
+
+# The only compiler-rt builtin the Darwin link needs beyond Rust's own
+# compiler_builtins is __isPlatformVersionAtLeast. Build it from LLVM's source
+# (Apache-2.0 with LLVM exception), so no Apple archive has to be mounted on
+# the build host; the resulting archive also satisfies clang's own lookup.
+ARG COMPILER_RT_LLVM_TAG=llvmorg-19.1.7
+ARG COMPILER_RT_OS_VERSION_CHECK_SHA256=bc0b9f10e8d1a1ac5905d710f1c9fead23878e31233748d580393edc4e3bfc18
+RUN set -eux; \
+    src=/tmp/os_version_check.c; \
+    curl -fsSL -o "$src" "https://raw.githubusercontent.com/llvm/llvm-project/${COMPILER_RT_LLVM_TAG}/compiler-rt/lib/builtins/os_version_check.c"; \
+    printf '%s  %s\n' "$COMPILER_RT_OS_VERSION_CHECK_SHA256" "$src" | sha256sum -c -; \
+    aarch64-apple-darwin-clang -O2 -c "$src" -o /tmp/os_version_check.o; \
+    archive="$(clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"; \
+    llvm-ar rcs "$archive" /tmp/os_version_check.o; \
+    llvm-nm "$archive" | grep -q ' T ___isPlatformVersionAtLeast'; \
+    printf 'int main(void) { if (__builtin_available(macOS 11.0, *)) { return 0; } return 1; }\n' > /tmp/available-smoke.c; \
+    aarch64-apple-darwin-clang /tmp/available-smoke.c -o /tmp/available-smoke; \
+    file /tmp/available-smoke | grep -q 'Mach-O 64-bit arm64'; \
+    rm -f /tmp/os_version_check.* /tmp/available-smoke*
+
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=aarch64-apple-darwin-clang \
+    CC_aarch64_apple_darwin=aarch64-apple-darwin-clang \
+    CXX_aarch64_apple_darwin=aarch64-apple-darwin-clang++ \
+    AR_aarch64_apple_darwin=llvm-ar \
+    RANLIB_aarch64_apple_darwin=llvm-ranlib
+
+RUN set -eux; \
+    real_zig="$(command -v zig)"; \
+    mv "$real_zig" "${real_zig}.real"; \
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      '' \
+      'script_path="$0"' \
+      'case "$script_path" in' \
+      '  /*) ;;' \
+      '  *) script_path="$(command -v -- "$script_path")" ;;' \
+      'esac' \
+      'real_zig="${script_path}.real"' \
+      '' \
+      'if [ "${1:-}" != "cc" ] && [ "${1:-}" != "c++" ]; then' \
+      '  exec "$real_zig" "$@"' \
+      'fi' \
+      '' \
+      'subcommand="$1"' \
+      'shift' \
+      'out=("$subcommand")' \
+      'declare -A seen_libs=()' \
+      'declare -A seen_frameworks=()' \
+      '' \
+      'dedupe_lib() {' \
+      '  case "$1" in' \
+      '    objc|iconv|System|c|m|z|charset|c++)' \
+      '      return 0' \
+      '      ;;' \
+      '    *)' \
+      '      return 1' \
+      '      ;;' \
+      '  esac' \
+      '}' \
+      '' \
+      'while [ "$#" -gt 0 ]; do' \
+      '  arg="$1"' \
+      '  shift' \
+      '  case "$arg" in' \
+      '    -l)' \
+      '      if [ "$#" -gt 0 ] && dedupe_lib "$1"; then' \
+      '        lib="$1"' \
+      '        shift' \
+      '        if [ -z "${seen_libs[$lib]+x}" ]; then' \
+      '          seen_libs[$lib]=1' \
+      '          out+=("-l" "$lib")' \
+      '        fi' \
+      '      else' \
+      '        out+=("$arg")' \
+      '      fi' \
+      '      ;;' \
+      '    -l*)' \
+      '      lib="${arg#-l}"' \
+      '      if dedupe_lib "$lib"; then' \
+      '        if [ -z "${seen_libs[$lib]+x}" ]; then' \
+      '          seen_libs[$lib]=1' \
+      '          out+=("$arg")' \
+      '        fi' \
+      '      else' \
+      '        out+=("$arg")' \
+      '      fi' \
+      '      ;;' \
+      '    -framework)' \
+      '      if [ "$#" -gt 0 ]; then' \
+      '        framework="$1"' \
+      '        framework_key="${framework,,}"' \
+      '        shift' \
+      '        if [ -z "${seen_frameworks[$framework_key]+x}" ]; then' \
+      '          seen_frameworks[$framework_key]=1' \
+      '          out+=("-framework" "$framework")' \
+      '        fi' \
+      '      else' \
+      '        out+=("$arg")' \
+      '      fi' \
+      '      ;;' \
+      '    *)' \
+      '      out+=("$arg")' \
+      '      ;;' \
+      '  esac' \
+      'done' \
+      '' \
+      'exec "$real_zig" "${out[@]}"' \
+      > "$real_zig"; \
+    chmod +x "$real_zig"; \
+    zig version

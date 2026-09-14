@@ -1,0 +1,176 @@
+# CNB pipelines for the Zed YOLO fork.
+# Source base: zed-industries/zed v1.20.0-pre (preview).
+#
+# Stage 1 of the two-stage build (BUILDING.md) on CNB compute, as the
+# automatic counterpart of the manual r740 run. Two pipelines:
+#
+#   $: vscode:    the build. `services: [vscode]` places it on the Dev-CPU pool
+#                 (1600 core-hours/month) instead of Build-CPU (160). It runs
+#                 every stage, publishes the stage-1 assets to the CNB release
+#                 of an `enhanced/*` tag, and stops itself. Start it from the
+#                 "cloud-native development" button, with
+#                 `cnb workspace start-workspace --repo lary.me/zed-yolo
+#                 --ref refs/tags/<tag>`, or through the tag_push pipeline.
+#   $: tag_push:  a 1-cpu Build-CPU pipeline that starts the workspace for an
+#                 `enhanced/*` tag and exits, so pushing the tag is the only
+#                 manual step.
+#
+# Both live under `$` because `vscode` and `tag_push` are repository-level
+# events. The workspace's user-data backup is capped at 100 MB, hence the
+# cleanup stage.
+$:
+  tag_push:
+    - name: zed-yolo-release-trigger
+      runner:
+        cpus: 1
+        tags: cnb:arch:amd64
+      docker:
+        image: curlimages/curl:latest
+      stages:
+        - name: start-cross-build-workspace
+          script: |
+            set -eu
+            case "$CNB_BRANCH" in
+              enhanced/*) ;;
+              *) echo "tag $CNB_BRANCH is not an enhanced/* release tag; nothing to build"; exit 78 ;;
+            esac
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $CNB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"ref\":\"refs/tags/$CNB_BRANCH\"}" \
+              "$CNB_API_ENDPOINT/$CNB_REPO_SLUG/-/workspace/start"
+            echo
+            echo "started the zed-yolo-cross-build workspace for $CNB_BRANCH"
+
+  vscode:
+    - name: zed-yolo-cross-build
+      runner:
+        cpus: 64
+        tags: cnb:arch:amd64
+      docker:
+        build:
+          dockerfile: .cnb/Dockerfile.zed-macos
+          by:
+            - .cnb/Dockerfile.zed-macos
+          # Rebuild the 9 GB image only when the toolchain changes, not on
+          # every Cargo.lock bump.
+          versionBy:
+            - .cnb/Dockerfile.zed-macos
+            - rust-toolchain.toml
+        # The container runs under user namespaces; `:rw` volumes are
+        # root-owned host directories that the namespaced root cannot write
+        # (Permission denied on 2026-09-14). The default copy-on-write type is
+        # an overlay: writable during the run, merged into the volume on
+        # success, so the caches still warm up across runs.
+        volumes:
+          - zed-yolo-cow-cargo-registry:/usr/local/cargo/registry:copy-on-write
+          - zed-yolo-cow-cargo-git:/usr/local/cargo/git:copy-on-write
+          - zed-yolo-cow-sccache:/var/cache/sccache:copy-on-write
+          - zed-yolo-cow-target:/workspace/target:copy-on-write
+      services:
+        - name: vscode
+          options:
+            onlyPreview: true
+            # Safety net: the stop-workspace end stage normally ends the run.
+            keepAliveTimeout: 10m
+      env:
+        CARGO_INCREMENTAL: "0"
+        CARGO_TERM_COLOR: never
+        CARGO_BUILD_JOBS: "64"
+        RUSTC_WRAPPER: sccache
+        SCCACHE_DIR: /var/cache/sccache
+        SCCACHE_CACHE_SIZE: 80G
+        BUILD_LOG_POLL_SECONDS: "5"
+        BUILD_HEARTBEAT_SECONDS: "120"
+        ZED_BUNDLE: "true"
+        ZED_ENHANCED_LABEL: Enhanced
+        ZED_UPDATE_EXPLANATION: "This Enhanced build is updated through the zed-yolo release process, not by zed.dev."
+        ZED_YOLO_RUNNER_CPUS: "64"
+        ZED_YOLO_RUNNER_MEMORY_GIB: "128"
+        ZED_YOLO_BENCHMARK: cnb-dev-cpu64
+      stages:
+        - name: toolchain
+          script: |
+            set -eux
+            rustc -Vv
+            cargo -V
+            id
+            nproc
+            free -h
+            df -h /workspace /var/cache/sccache
+            touch /usr/local/cargo/git/.writable /usr/local/cargo/registry/.writable /var/cache/sccache/.writable /workspace/target/.writable
+            aarch64-apple-darwin-clang --version | head -n 1
+            zig version
+            cnb --help >/dev/null
+            test -d "$SDKROOT"
+            llvm-nm "$(clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a" | grep -q ___isPlatformVersionAtLeast
+            sccache --show-stats || true
+        - name: macho-linker-dedupe-smoke
+          script: bash .cnb/run-zed-build-step.sh macho-smoke
+        - name: generate-licenses
+          script: |
+            set -eux
+            ALLOW_MISSING_LICENSES=yes script/generate-licenses
+        - name: init-release-metadata
+          script: bash .cnb/run-zed-build-step.sh metadata
+        - name: build-aarch64-apple-darwin-zed-cli
+          script: >
+            bash .cnb/run-zed-build-step.sh build
+            aarch64-apple-darwin zed-cli
+            --package zed --package cli
+        # Separate invocation, as in script/bundle-mac, so feature unification
+        # from the app crates does not change what remote_server links against.
+        - name: build-aarch64-apple-darwin-remote-server
+          script: >
+            bash .cnb/run-zed-build-step.sh build
+            aarch64-apple-darwin remote-server
+            --package remote_server
+        - name: package-aarch64-apple-darwin
+          script: bash .cnb/run-zed-build-step.sh package aarch64-apple-darwin all
+        # Static musl remote servers for Linux hosts; zig cross-links both.
+        - name: build-x86_64-unknown-linux-musl-remote-server
+          script: >
+            bash .cnb/run-zed-build-step.sh build
+            x86_64-unknown-linux-musl remote-server
+            --package remote_server
+        - name: package-x86_64-unknown-linux-musl-remote-server
+          script: bash .cnb/run-zed-build-step.sh package x86_64-unknown-linux-musl remote-server
+        - name: build-aarch64-unknown-linux-musl-remote-server
+          script: >
+            bash .cnb/run-zed-build-step.sh build
+            aarch64-unknown-linux-musl remote-server
+            --package remote_server
+        - name: package-aarch64-unknown-linux-musl-remote-server
+          script: bash .cnb/run-zed-build-step.sh package aarch64-unknown-linux-musl remote-server
+        - name: build-cache-stats
+          script: bash .cnb/run-zed-build-step.sh stats
+        - name: publish-release
+          script: |
+            set -eu
+            ls -lh dist/
+            if [ "${CNB_IS_TAG:-false}" = true ]; then
+              case "$CNB_BRANCH" in
+                enhanced/*)
+                  script/publish-cnb-release --repo "$CNB_REPO_SLUG" --tag "$CNB_BRANCH" \
+                    dist/zed-yolo-v*.tar.zst dist/zed-yolo-v*.tar.zst.sha256 dist/zed-yolo-v*.tar.zst.build.json \
+                    dist/zed-remote-server-*.gz dist/zed-remote-server-*.gz.sha256
+                  ;;
+                *) echo "tag $CNB_BRANCH is not an enhanced/* tag; not publishing" ;;
+              esac
+            else
+              echo "ref $CNB_BRANCH is not a tag; not publishing (stage-1 assets stay in this run)"
+            fi
+        - name: cleanup-workspace-dist
+          script: |
+            set -eux
+            rm -rf dist
+            git status --short --untracked-files=all
+      endStages:
+        - name: stop-workspace
+          script: |
+            set -u
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $CNB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"pipelineId\":\"$CNB_PIPELINE_ID\"}" \
+              "$CNB_API_ENDPOINT/workspace/stop" || echo "self-stop failed; keepAliveTimeout will reclaim the workspace"
