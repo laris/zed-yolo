@@ -151,8 +151,12 @@ $:
             if [ "${CNB_IS_TAG:-false}" = true ]; then
               case "$CNB_BRANCH" in
                 enhanced/*)
+                  # The Darwin package feeds stage 2; the Linux tarballs would only
+                  # duplicate the remote-server .gz assets.
                   script/publish-cnb-release --repo "$CNB_REPO_SLUG" --tag "$CNB_BRANCH" \
-                    dist/zed-yolo-v*.tar.zst dist/zed-yolo-v*.tar.zst.sha256 dist/zed-yolo-v*.tar.zst.build.json \
+                    dist/zed-yolo-v*-aarch64-apple-darwin-*.tar.zst \
+                    dist/zed-yolo-v*-aarch64-apple-darwin-*.tar.zst.sha256 \
+                    dist/zed-yolo-v*-aarch64-apple-darwin-*.tar.zst.build.json \
                     dist/zed-remote-server-*.gz dist/zed-remote-server-*.gz.sha256
                   ;;
                 *) echo "tag $CNB_BRANCH is not an enhanced/* tag; not publishing" ;;
