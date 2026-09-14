@@ -36,7 +36,10 @@ metal.workspace = true
 objc.workspace = true
 parking_lot.workspace = true
 
-[target.'cfg(target_os = "macos")'.build-dependencies]
+# Not gated on cfg(target_os = "macos"): cargo evaluates that against the
+# build host, which would leave the (target-gated) build script without
+# cbindgen when cross-compiling for macOS from Linux.
+[build-dependencies]
 cbindgen.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
