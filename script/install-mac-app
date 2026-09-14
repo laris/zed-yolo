@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Install a stage-2 bundle as the new Zed Preview and switch to it, keeping the
+# previous version for rollback (BUILDING.md, "Install and switch").
+#
+# Two slots hold the same bundle name: /Applications/<name>.app and
+# ~/Applications/<name>.app. The slot the running Zed was launched from is
+# "current"; the other slot receives the candidate, the current instance is
+# quit through its bundle id, the new one is opened, and the roles swap. The
+# next release goes into the slot that now holds the previous version.
+#
+#   script/install-mac-app ["target/aarch64-apple-darwin/release/dmg/Zed Preview.app"]
+#   script/install-mac-app --rollback      quit the current slot, open the previous one
+#   script/install-mac-app --status
+#   options: --dry-run  --no-verify  --force-inside-zed
+#
+# Both slots share one data dir. Zed's database migrations are forward-only,
+# so the data dir's db/ is copied to ~/Library/Application Support/zed-yolo/
+# db-backups/ before the new version first runs; rollback after a migration
+# may need that copy. Run this from Terminal, not from a terminal inside Zed:
+# quitting the current instance would end that session.
+set -euo pipefail
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+mode=install
+candidate=""
+dry_run=0
+verify=1
+force_inside_zed=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rollback) mode=rollback; shift ;;
+    --status) mode=status; shift ;;
+    --dry-run) dry_run=1; shift ;;
+    --no-verify) verify=0; shift ;;
+    --force-inside-zed) force_inside_zed=1; shift ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *) candidate=$1; shift ;;
+  esac
+done
+candidate=${candidate:-$repo_root/target/aarch64-apple-darwin/release/dmg/Zed Preview.app}
+
+state_dir="$HOME/Library/Application Support/zed-yolo"
+state_file="$state_dir/install-state"
+data_dir="$HOME/Library/Application Support/Zed"
+mkdir -p "$state_dir"
+
+info() { printf '      %s\n' "$*"; }
+step() { printf '== %s ==\n' "$*"; }
+run() { if [ "$dry_run" = 1 ]; then printf 'dry-run: %s\n' "$*"; else "$@"; fi; }
+bundle_id() { /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null; }
+bundle_version() { "$1/Contents/MacOS/zed" --system-specs 2>/dev/null | awk '/^Zed: v/ {print $2; exit}'; }
+running_zeds() {
+  local handlers
+  handlers=$(ps -axo pid=,args= | awk '/ --crash-handler /{print $1}' | tr '\n' ' ')
+  ps -axo pid=,comm= | grep -E '/Contents/MacOS/zed$' |
+    sed -E 's#^ *([0-9]+) +(.*)/Contents/MacOS/zed$#\1 \2#' |
+    awk -v handlers=" $handlers" 'index(handlers, " " $1 " ") == 0'
+}
+running_bundle_of() {  # bundle path of the running instance with bundle id $1, if any
+  while read -r pid bundle; do
+    [ -n "$pid" ] || continue
+    [ "$(bundle_id "$bundle")" = "$1" ] && { echo "$bundle"; return 0; }
+  done < <(running_zeds)
+  return 1
+}
+load_state() { current=""; previous=""; if [ -f "$state_file" ]; then . "$state_file"; fi; }
+save_state() {
+  printf 'current=%q\nprevious=%q\nswitched_at=%q\n' "$1" "$2" "$(date +%Y-%m-%dT%H:%M:%S)" > "$state_file"
+}
+quit_instances() {  # $1 bundle id
+  osascript -e "tell application id \"$1\" to quit" >/dev/null 2>&1 || true
+  for _ in $(seq 1 45); do running_bundle_of "$1" >/dev/null || return 0; sleep 1; done
+  echo "instances of $1 did not quit within 45s" >&2
+  return 1
+}
+launch_and_wait() {  # $1 bundle path
+  local since
+  since=$(date +%Y-%m-%dT%H:%M:%S)
+  open -a "$1"
+  for _ in $(seq 1 60); do
+    if awk -v s="$since" '$1 >= s' ~/Library/Logs/Zed/Zed.log 2>/dev/null | grep -q 'Rendered first frame'; then
+      info "rendered first frame: $(awk -v s="$since" '$1 >= s' ~/Library/Logs/Zed/Zed.log | grep -m1 'starting zed version' | sed 's/.*starting zed version //; s/ ==.*//')"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "no 'Rendered first frame' within 60s of opening $1; check ~/Library/Logs/Zed/Zed.log" >&2
+  return 1
+}
+
+if [ "$force_inside_zed" = 0 ] && { [ "${TERM_PROGRAM:-}" = zed ] || [ -n "${ZED_TERM:-}" ]; }; then
+  echo "this terminal runs inside Zed; quitting the current Zed would end this session." >&2
+  echo "Run from Terminal.app/tmux, or pass --force-inside-zed if this Zed is not the one being replaced." >&2
+  exit 2
+fi
+
+test -x "$candidate/Contents/MacOS/zed" || { echo "not an app bundle: $candidate" >&2; exit 2; }
+candidate=$(cd "$candidate" && pwd)
+name=$(basename "$candidate")                     # Zed Preview.app
+identifier=$(bundle_id "$candidate")
+slot_a="/Applications/$name"
+slot_b="$HOME/Applications/$name"
+load_state
+
+step "slots for $identifier"
+for slot in "$slot_a" "$slot_b"; do
+  if [ -d "$slot" ]; then info "$slot: $(bundle_version "$slot" || echo unreadable)"; else info "$slot: empty"; fi
+done
+running_bundle=$(running_bundle_of "$identifier" || true)
+if [ -n "$running_bundle" ]; then
+  info "running: $running_bundle"
+  current_slot=$running_bundle
+elif [ -n "$current" ] && [ -d "$current" ]; then
+  current_slot=$current
+elif [ -d "$slot_a" ]; then
+  current_slot=$slot_a
+else
+  current_slot=""
+fi
+
+if [ "$mode" = status ]; then
+  info "current: ${current_slot:-none}"
+  info "previous (state file): ${previous:-unknown}"
+  exit 0
+fi
+
+if [ "$mode" = rollback ]; then
+  test -n "$previous" && test -d "$previous" || { echo "no previous slot recorded in $state_file" >&2; exit 1; }
+  step "rollback: $current_slot -> $previous ($(bundle_version "$previous"))"
+  info "the database may have been migrated by the newer version; backups are in $state_dir/db-backups"
+  [ -n "$running_bundle" ] && run quit_instances "$identifier"
+  run launch_and_wait "$previous"
+  run save_state "$previous" "$current_slot"
+  exit 0
+fi
+
+case "$current_slot" in
+  "$slot_a") target_slot=$slot_b ;;
+  "$slot_b") target_slot=$slot_a ;;
+  "") target_slot=$slot_a ;;
+  *) echo "the running Zed was launched from $current_slot, which is neither slot; quit it first" >&2; exit 1 ;;
+esac
+if [ "$candidate" = "$current_slot" ]; then echo "the candidate is the current slot itself" >&2; exit 1; fi
+step "install $(bundle_version "$candidate") into $target_slot; current is ${current_slot:-none}"
+
+if [ "$verify" = 1 ]; then
+  step "verify candidate"
+  # With the current Preview running this stops after the static checks and
+  # --system-specs; with nothing running it also does the window-level run.
+  run "$repo_root/script/verify-mac-app" "$candidate"
+fi
+
+if [ -d "$data_dir/db" ]; then
+  backup="$state_dir/db-backups/$(date +%Y%m%d-%H%M%S)-$( [ -n "$current_slot" ] && bundle_version "$current_slot" || echo unknown)"
+  step "back up $data_dir/db -> $backup"
+  run mkdir -p "$backup"
+  run ditto "$data_dir/db" "$backup/db"
+  # keep the three newest backups
+  ls -1dt "$state_dir"/db-backups/*/ 2>/dev/null | tail -n +4 | while read -r old; do run rm -rf "$old"; done || true
+fi
+
+if [ "$candidate" != "$target_slot" ]; then
+  step "copy into $target_slot"
+  if [ -d "$target_slot" ] && running_zeds | grep -qF " $target_slot"; then
+    echo "$target_slot has a running process; quit it first" >&2; exit 1
+  fi
+  run mkdir -p "$(dirname "$target_slot")"
+  run rm -rf "$target_slot"
+  run ditto "$candidate" "$target_slot"
+fi
+run /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$target_slot"
+
+if [ -n "$running_bundle" ]; then
+  step "quit current $identifier ($running_bundle)"
+  run quit_instances "$identifier"
+fi
+step "open $target_slot"
+run launch_and_wait "$target_slot"
+run save_state "$target_slot" "${current_slot:-}"
+step "done: current=$target_slot previous=${current_slot:-none}"
+info "rollback: script/install-mac-app --rollback"

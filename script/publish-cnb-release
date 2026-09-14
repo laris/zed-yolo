@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Create the CNB release for a tag (if missing) and upload assets to it.
+#
+# usage: script/publish-cnb-release [--repo GROUP/NAME] [--name TITLE]
+#                                   [--body TEXT] --tag TAG FILE...
+#
+# With CNB_TOKEN in the environment (every CNB pipeline has it; on a Mac run
+# the script through run_cnb_git_no_keychain.sh, which injects it) the script
+# talks to the REST API with curl and typed JSON bodies. Without a token it
+# falls back to the official `cnb` CLI, whose login keyring only it reads;
+# the CLI's argument handling differs between its binary and npm builds, so
+# the API path is the one used in automation. Existing assets with the same
+# name are overwritten, so re-running after a partial upload is safe. CNB
+# traffic never uses the workstation proxy.
+set -euo pipefail
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+export NO_PROXY='*' no_proxy='*'
+
+repo=${CNB_REPO_SLUG:-lary.me/zed-yolo}
+tag=""
+name=""
+body=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo=$2; shift 2 ;;
+    --tag) tag=$2; shift 2 ;;
+    --name) name=$2; shift 2 ;;
+    --body) body=$2; shift 2 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+test -n "$tag" || { echo "--tag is required" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "no files to upload" >&2; exit 2; }
+for file in "$@"; do test -f "$file" || { echo "missing file: $file" >&2; exit 1; }; done
+
+endpoint=${CNB_API_ENDPOINT:-https://api.cnb.cool}
+encoded_tag=${tag//\//%2F}
+json_string() { printf '%s' "$1" | jq -Rs '.'; }
+
+if [ -n "${CNB_TOKEN:-}" ]; then
+  # Every helper prints {"data": <response>} so both transports look alike.
+  api() {  # method path [json-body]
+    local method=$1 path=$2 data=${3:-}
+    curl -sS -X "$method" -H "Authorization: Bearer $CNB_TOKEN" -H 'Accept: application/json' \
+      -H 'Content-Type: application/json' ${data:+-d "$data"} "$endpoint/$repo/-/$path" | jq -c '{data: .}'
+  }
+  get_release() { api GET "releases/tags/$encoded_tag"; }
+  create_release() {
+    api POST releases "$(jq -cn --arg t "$tag" --arg n "${name:-$tag}" --arg b "$body" --argjson p "$1" \
+      '{tag_name: $t, name: $n, body: $b, prerelease: $p}')"
+  }
+  upload_ticket() { api POST "releases/$1/asset-upload-url" "$(jq -cn --arg a "$2" --argjson s "$3" '{asset_name: $a, size: $s, overwrite: true}')"; }
+  confirm_upload() { api POST "releases/$1/asset-upload-confirmation/$2/$3"; }
+else
+  cnb_bin=${CNB_BIN:-cnb}
+  if ! command -v "$cnb_bin" >/dev/null; then
+    if [ -x "$HOME/.local/bin/cnb" ]; then cnb_bin="$HOME/.local/bin/cnb"; else
+      echo "neither CNB_TOKEN nor the cnb CLI is available (npm install -g @cnbcool/cnb-cli)" >&2; exit 127
+    fi
+  fi
+  cli() { "$cnb_bin" "$@" -v; }   # -v prints the raw JSON response as {status, data}
+  get_release() { cli releases get-release-by-tag --repo "$repo" --tag "$tag"; }
+  create_release() {
+    local flags=(); [ "$1" = true ] && flags=(--prerelease)
+    cli releases post-release --repo "$repo" --tag-name "$tag" --name "${name:-$tag}" ${body:+--body "$body"} ${flags[@]+"${flags[@]}"}
+  }
+  upload_ticket() { cli releases post-release-asset-upload-url --repo "$repo" --release-id "$1" --asset-name "$2" --size "$3" --overwrite; }
+  confirm_upload() { cli releases post-release-asset-upload-confirmation --repo "$repo" --release-id "$1" --upload-token "$2" --asset-path "$3"; }
+fi
+
+release_json=$(get_release 2>/dev/null || true)
+release_id=$(printf '%s' "$release_json" | jq -r '.data.id // empty' 2>/dev/null || true)
+if [ -z "$release_id" ]; then
+  prerelease=false
+  case "$tag" in *-pre*) prerelease=true ;; esac
+  release_json=$(create_release "$prerelease")
+  release_id=$(printf '%s' "$release_json" | jq -r '.data.id // empty')
+  test -n "$release_id" || { echo "could not create release $tag:" >&2; printf '%s\n' "$release_json" >&2; exit 1; }
+  echo "created release $tag (id $release_id) in $repo"
+else
+  echo "release $tag exists (id $release_id) in $repo"
+fi
+
+for file in "$@"; do
+  asset=$(basename "$file")
+  # `stat -f` means filesystem status on GNU coreutils; wc is portable.
+  size=$(wc -c < "$file" | tr -d '[:space:]')
+  case "$size" in ''|*[!0-9]*) echo "could not size $file: '$size'" >&2; exit 1 ;; esac
+  ticket=$(upload_ticket "$release_id" "$asset" "$size")
+  upload_url=$(printf '%s' "$ticket" | jq -r '.data.upload_url // empty')
+  verify_url=$(printf '%s' "$ticket" | jq -r '.data.verify_url // empty')
+  if [ -z "$upload_url" ] || [ -z "$verify_url" ]; then
+    echo "no upload ticket for $asset:" >&2; printf '%s\n' "$ticket" >&2; exit 1
+  fi
+  # verify_url ends in .../asset-upload-confirmation/<upload_token>/<asset_path>
+  upload_token=$(printf '%s' "$verify_url" | sed -E 's#.*/asset-upload-confirmation/([^/]+)/.*#\1#')
+  asset_path=$(printf '%s' "$verify_url" | sed -E 's#.*/asset-upload-confirmation/[^/]+/(.*)#\1#')
+  curl -fsS -X PUT -H 'Content-Type: application/octet-stream' --upload-file "$file" "$upload_url" >/dev/null
+  confirm_upload "$release_id" "$upload_token" "$asset_path" >/dev/null
+  echo "uploaded $asset ($size bytes)"
+done
+
+echo "assets of $tag:"
+get_release | jq -r '.data.assets[]? | "  \(.name)\t\(.size // "")"'

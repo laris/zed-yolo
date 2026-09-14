@@ -8,6 +8,7 @@ target_dir="release"
 open_result=false
 local_install=false
 can_code_sign=false
+prebuilt_dir=""
 
 # This must match the team in the provisioning profile.
 IDENTITY="Zed Industries, Inc."
@@ -23,11 +24,15 @@ Options:
   -d    Compile in debug mode
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
   -i    Install the resulting DMG into /Applications.
+  -p DIR
+        Skip compilation and bundle the release binaries (zed, cli,
+        remote_server) found in DIR, e.g. an extracted stage-1 package
+        produced by .cnb/cross-build-macos.sh on a Linux host.
   -h    Display this help and exit.
   "
 }
 
-while getopts 'dloih' flag
+while getopts 'dloihp:' flag
 do
     case "${flag}" in
         o) open_result=true;;
@@ -38,6 +43,7 @@ do
             target_dir="debug"
             ;;
         i) local_install=true;;
+        p) prebuilt_dir="${OPTARG}";;
         h)
            help_info
            exit 0
@@ -47,12 +53,23 @@ done
 
 shift $((OPTIND-1))
 
+if [[ -n "${prebuilt_dir}" && "${target_dir}" != "release" ]]; then
+    echo "-p expects release binaries; do not combine it with -d" >&2
+    exit 1
+fi
+
 
 # Get release channel
 pushd crates/zed
 channel=$(<RELEASE_CHANNEL)
-export ZED_RELEASE_CHANNEL="${channel}"
 popd
+# A stage-1 package records the channel it was compiled for (which may be a
+# test channel such as `dev`); the bundle metadata must match the binary.
+if [[ -n "${prebuilt_dir}" && -f "${prebuilt_dir}/RELEASE_CHANNEL" ]]; then
+    channel=$(<"${prebuilt_dir}/RELEASE_CHANNEL")
+    echo "Using release channel '${channel}' recorded in ${prebuilt_dir}"
+fi
+export ZED_RELEASE_CHANNEL="${channel}"
 
 export ZED_BUNDLE=true
 
@@ -81,16 +98,55 @@ else
     exit 1
 fi
 
-# Generate the licenses first, so they can be baked into the binaries
-script/generate-licenses
+# Generate the licenses first, so they can be baked into the binaries. Prebuilt
+# binaries already embed the licenses generated on the stage-1 host.
+if [[ -z "${prebuilt_dir}" ]]; then
+    script/generate-licenses
+fi
 
 rustup target add $target_triple
 
-echo "Compiling zed binaries"
-cargo --config .cargo/bundle-config.toml build ${build_flag} --package zed --package cli --target $target_triple
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple
+# When the host has only the Command Line Tools (no full Xcode), the `metal`
+# compiler is missing and ahead-of-time shader compilation fails. Detect that
+# and fall back to runtime shader compilation, matching the cross-build path.
+zed_features=()
+if ! xcrun --find metal >/dev/null 2>&1; then
+    echo "metal compiler not available; using gpui_platform/runtime_shaders"
+    zed_features=(--features gpui_platform/runtime_shaders)
+fi
+
+if [[ -n "${prebuilt_dir}" ]]; then
+    echo "Using prebuilt ${target_triple} binaries from ${prebuilt_dir}"
+    # remote_server is optional: the app downloads upstream's release asset for
+    # its own version and channel when none is bundled, so stage 1 stopped
+    # building it (BUILDING.md §0).
+    prebuilt_binaries=(zed cli)
+    if [[ -f "${prebuilt_dir}/remote_server" ]]; then
+        prebuilt_binaries+=(remote_server)
+    fi
+    prebuilt_paths=()
+    for binary in "${prebuilt_binaries[@]}"; do
+        if [[ ! -f "${prebuilt_dir}/${binary}" ]]; then
+            echo "Missing prebuilt binary: ${prebuilt_dir}/${binary}" >&2
+            exit 1
+        fi
+        prebuilt_paths+=("${prebuilt_dir}/${binary}")
+    done
+    python3 script/check-macho-dylibs.py "${prebuilt_paths[@]}"
+    mkdir -p "target/${target_triple}/${target_dir}"
+    cp "${prebuilt_paths[@]}" "target/${target_triple}/${target_dir}/"
+    # cargo-bundle then only assembles the .app around the binary in target/;
+    # a Linux-built target dir cannot be reused by cargo, so nothing is compiled.
+    export CARGO_BUNDLE_SKIP_BUILD=true
+else
+    echo "Compiling zed binaries"
+    cargo --config .cargo/bundle-config.toml build ${build_flag} --package zed --package cli --target $target_triple ${zed_features[@]+"${zed_features[@]}"}
+    # Build remote_server in separate invocation to prevent feature unification from other crates
+    # from influencing dynamic libraries required by it. The remote_server depends
+    # on gpui_platform (which pulls in gpui_macos on Darwin), so it needs the same
+    # shader feature when the host has no `metal` compiler.
+    cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple ${zed_features[@]+"${zed_features[@]}"}
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -100,7 +156,7 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root ${zed_features[@]+"${zed_features[@]}"} | xargs)
 
 mv Cargo.toml.backup Cargo.toml
 popd
@@ -225,6 +281,13 @@ function sign_app_binaries() {
     bundle_name=$(basename "$app_path")
 
     if [ "$local_install" = true ]; then
+        # Replacing the bundle a running Zed was launched from pulls the files
+        # out from under it (and, when an agent session is hosted by that Zed,
+        # ends the session). Refuse instead of silently breaking it.
+        if ps -axo comm= | grep -qxF "/Applications/${bundle_name}/Contents/MacOS/zed"; then
+            echo "/Applications/${bundle_name} is running; quit it first or bundle without -i" >&2
+            exit 1
+        fi
         rm -rf "/Applications/$bundle_name"
         mv "$app_path" "/Applications/$bundle_name"
         echo "Installed application bundle: /Applications/$bundle_name"
@@ -236,8 +299,10 @@ function sign_app_binaries() {
         open "$app_path"
     fi
 
-    if [[ "$target_dir" = "debug" ]]; then
-        echo "Debug build detected - skipping DMG creation and signing"
+    # A local install has already moved the bundle into /Applications, so there
+    # is nothing left to package into a DMG (upstream's script errors here).
+    if [[ "$target_dir" = "debug" || "$local_install" = true ]]; then
+        echo "Debug build or local install detected - skipping DMG creation and signing"
         if [ "$local_install" = false ]; then
             echo "Created application bundle:"
             echo "$app_path"
@@ -280,6 +345,29 @@ function sign_app_binaries() {
         if [ "$open_result" = true ]; then
             open $dmg_target_directory
         fi
+    fi
+}
+
+function copy_enhanced_remote_servers() {
+    local resource_dir="${app_path}/Contents/Resources/remote_servers"
+    mkdir -p "${resource_dir}"
+    shopt -s nullglob
+    local copied=false
+    local remote_server_assets=(
+        dist/zed-remote-server-linux-*.gz
+        target/zed-remote-server-linux-*.gz
+    )
+    for asset in ${remote_server_assets[@]+"${remote_server_assets[@]}"}; do
+        cp "${asset}" "${resource_dir}/$(basename "${asset}")"
+        copied=true
+    done
+    shopt -u nullglob
+
+    if [[ "${copied}" = true ]]; then
+        echo "Copied enhanced remote server assets into ${resource_dir}"
+        ls -lh "${resource_dir}"/zed-remote-server-linux-*.gz
+    else
+        echo "No enhanced Linux remote server assets found to bundle"
     fi
 }
 
@@ -342,15 +430,36 @@ upload_debug_symbols
 # must be extracted before the binaries are stripped below. The .dwarf files
 # also keep symbols recoverable when the sentry upload is skipped.
 if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
-    extract_debug_symbols
+    # dsymutil needs the object files the linker recorded, which for prebuilt
+    # binaries only exist on the stage-1 host; strip still works on its own.
+    if [[ -z "${prebuilt_dir}" ]]; then
+        extract_debug_symbols
+    fi
     strip -x "target/${target_triple}/${target_dir}/zed"
     strip -x "target/${target_triple}/${target_dir}/cli"
-    strip -x "target/${target_triple}/${target_dir}/remote_server"
+    if [[ -f "target/${target_triple}/${target_dir}/remote_server" ]]; then
+        strip -x "target/${target_triple}/${target_dir}/remote_server"
+    fi
 fi
 
 cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+copy_enhanced_remote_servers
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+if [[ -f "target/$target_triple/release/remote_server" ]]; then
+    sign_binary "target/$target_triple/release/remote_server"
+    gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+else
+    echo "No remote_server binary; the app will fetch upstream's release asset for its version"
+fi
+
+if [[ -n "${prebuilt_dir}" ]]; then
+    # Cargo trusts an existing output whose fingerprint is fresh, so a prebuilt
+    # binary left in target/ would be bundled by the next native run without a
+    # relink. Removing the copies forces cargo to produce its own again.
+    rm -f "target/${target_triple}/${target_dir}/zed" \
+        "target/${target_triple}/${target_dir}/cli" \
+        "target/${target_triple}/${target_dir}/remote_server"
+    echo "Removed prebuilt copies from target/${target_triple}/${target_dir}"
+fi

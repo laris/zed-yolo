@@ -1,0 +1,269 @@
+# Cross-build image for the zed-yolo two-stage build: compiles `zed` and `cli`
+# for aarch64-apple-darwin on an x86_64 Linux host (BUILDING.md §1.2).
+#
+# Every input is pinned so that r740 and CNB build the same image from this
+# file at different times: the Debian base by digest, the toolchain packages
+# by exact Debian version (trixie is a stable release, so the live mirror
+# serves them until a point release moves them, and then the build fails
+# loudly instead of drifting), rustup and the Rust toolchain by version and
+# checksum, the macOS SDK and compiler-rt source by checksum, cargo-bundle by
+# commit. snapshot.debian.org would pin the rest too, but CNB's egress gets
+# "509 Bandwidth Limit Exceeded" from it. The resulting identity is written
+# to /etc/zed-yolo-toolchain.json and copied into every package's .build.json.
+#
+# To move a pin, change the ARG and rebuild on both hosts
+# (ZED_CROSS_REBUILD_IMAGE=1 on r740; CNB rebuilds through `versionBy`).
+
+ARG DEBIAN_IMAGE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+FROM ${DEBIAN_IMAGE}
+# An ARG declared before FROM is out of scope afterwards; redeclare it so the
+# identity file below can record the base digest.
+ARG DEBIAN_IMAGE
+
+# Debian packages that shape the binaries, at the versions of Debian 13.3.
+ARG CLANG_DEB_VERSION=1:19.0-63
+ARG SCCACHE_DEB_VERSION=0.10.0-4
+ARG PROTOBUF_DEB_VERSION=3.21.12-11+deb13u1
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_INIT_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+ARG RUST_TOOLCHAIN=1.97.1
+ARG CARGO_ABOUT_VERSION=0.8.2
+ARG CARGO_BUNDLE_REV=2be2669972dff3ddd4daf89a2cb29d2d06cad7c7
+# SDK 26 is required so the cross-build sets `macos_sdk_26_or_later` (see
+# crates/ui/build.rs); it decides the title-bar traffic-light padding on
+# macOS 26 hosts. Checksum from the release's sha256sum.txt.
+ARG MACOS_SDK_VERSION=26.1
+ARG MACOS_SDK_SHA256=beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c
+ARG COMPILER_RT_LLVM_TAG=llvmorg-19.1.7
+ARG COMPILER_RT_OS_VERSION_CHECK_SHA256=bc0b9f10e8d1a1ac5905d710f1c9fead23878e31233748d580393edc4e3bfc18
+
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH
+ENV CARGO_INCREMENTAL=0
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/var/cache/sccache
+ENV SCCACHE_CACHE_SIZE=80G
+ENV SDKROOT=/opt/MacOSX${MACOS_SDK_VERSION}.sdk
+
+RUN set -eux; \
+    printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80retries; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      "clang=${CLANG_DEB_VERSION}" \
+      cmake \
+      curl \
+      file \
+      git \
+      jq \
+      "libclang-dev=${CLANG_DEB_VERSION}" \
+      "libprotobuf-dev=${PROTOBUF_DEB_VERSION}" \
+      libssl-dev \
+      "lld=${CLANG_DEB_VERSION}" \
+      "llvm=${CLANG_DEB_VERSION}" \
+      pkg-config \
+      "protobuf-compiler=${PROTOBUF_DEB_VERSION}" \
+      python3 \
+      "sccache=${SCCACHE_DEB_VERSION}" \
+      time \
+      xz-utils \
+      zip \
+      zstd; \
+    rm -rf /var/lib/apt/lists/*; \
+    update-alternatives --install /usr/bin/cc cc /usr/bin/clang 100; \
+    update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++ 100; \
+    update-alternatives --set cc /usr/bin/clang; \
+    update-alternatives --set c++ /usr/bin/clang++
+
+# webrtc-sys' build script (written for macOS hosts) runs the *host*
+# `cc --print-search-dirs`, takes the `libraries: =` value and appends
+# /lib/darwin to find libclang_rt.osx.a. On macOS that value is the single
+# clang resource directory; here clang also lists GCC's directories, which the
+# script concatenates into one bogus path. This shim answers that one query
+# the macOS way and hands everything else to clang.
+RUN set -eux; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'if [ "${1:-}" = "--print-search-dirs" ] || [ "${1:-}" = "-print-search-dirs" ]; then' \
+      '  printf "programs: =%s\nlibraries: =%s\n" "$(dirname "$(command -v clang)")" "$(clang -print-resource-dir)"' \
+      '  exit 0' \
+      'fi' \
+      'exec clang "$@"' \
+      > /usr/local/bin/cc; \
+    chmod +x /usr/local/bin/cc; \
+    test "$(cc --print-search-dirs | sed -n 's/^libraries: =//p')" = "$(clang -print-resource-dir)"; \
+    printf 'int main(void) { return 0; }\n' > /tmp/host-smoke.c; \
+    cc /tmp/host-smoke.c -o /tmp/host-smoke && /tmp/host-smoke; \
+    rm -f /tmp/host-smoke*
+
+# rustup by version and checksum; the toolchain, components and targets are
+# exactly those of rust-toolchain.toml plus the Darwin target, so rustup never
+# has to download anything when cargo runs inside the container.
+RUN set -eux; \
+    curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"; \
+    printf '%s  /tmp/rustup-init\n' "$RUSTUP_INIT_SHA256" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN" \
+      --component rustfmt --component clippy --component rust-analyzer --component rust-src \
+      --target wasm32-wasip2 --target wasm32-unknown-unknown --target x86_64-unknown-linux-musl --target aarch64-apple-darwin; \
+    rm -f /tmp/rustup-init; \
+    rustc -Vv; \
+    cargo -V
+
+RUN set -eux; \
+    sdk_archive="/tmp/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"; \
+    curl -fsSL \
+      -o "$sdk_archive" \
+      "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"; \
+    printf '%s  %s\n' "$MACOS_SDK_SHA256" "$sdk_archive" | sha256sum -c -; \
+    rm -rf "$SDKROOT"; \
+    tar -xJf "$sdk_archive" -C /opt; \
+    rm -f "$sdk_archive"; \
+    test -d "$SDKROOT"; \
+    test -d "$SDKROOT/System/Library/Frameworks/ScreenCaptureKit.framework"; \
+    framework_dir="$SDKROOT/System/Library/Frameworks"; \
+    ln -sfn AppKit.framework "$framework_dir/Appkit.framework"; \
+    if [ -e "$framework_dir/AppKit.framework/AppKit.tbd" ] && [ ! -e "$framework_dir/AppKit.framework/Appkit.tbd" ]; then \
+      ln -s AppKit.tbd "$framework_dir/AppKit.framework/Appkit.tbd"; \
+    fi; \
+    if [ -e "$framework_dir/AppKit.framework/AppKit" ] && [ ! -e "$framework_dir/AppKit.framework/Appkit" ]; then \
+      ln -s AppKit "$framework_dir/AppKit.framework/Appkit"; \
+    fi; \
+    printf 'SDKROOT=%s\n' "$SDKROOT"
+
+# Minimal xcrun stand-in: answers the two SDK queries that Zed build scripts
+# make (media, ui) from $SDKROOT and fails for everything else, so
+# `xcrun --find metal` keeps selecting runtime shader compilation.
+RUN set -eux; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'if [ "$1" = "--sdk" ] && [ "$2" = "macosx" ] && [ -n "${SDKROOT:-}" ]; then' \
+      '  case "$3" in' \
+      '    --show-sdk-path) printf "%s\n" "$SDKROOT" && exit 0 ;;' \
+      '    --show-sdk-version) jq -r .Version "$SDKROOT/SDKSettings.json" && exit 0 ;;' \
+      '  esac' \
+      'fi' \
+      'echo "unsupported xcrun shim invocation: $*" >&2' \
+      'exit 127' \
+      > /usr/local/bin/xcrun; \
+    chmod +x /usr/local/bin/xcrun; \
+    SDKROOT="$SDKROOT" xcrun --sdk macosx --show-sdk-version
+
+RUN set -eux; \
+    cargo install cargo-about --version "$CARGO_ABOUT_VERSION" --locked; \
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --rev "$CARGO_BUNDLE_REV"; \
+    rm -rf /usr/local/cargo/registry/cache /usr/local/cargo/registry/src /usr/local/cargo/git
+
+# Darwin targets compile and link with Debian's clang + LLVM's ld64.lld: both
+# are plain glibc binaries and run on any kernel the image runs on (the
+# CentOS 7 build host cannot run zig, whose cache needs statx(2)).
+# -mcpu=apple-m1 matches rustc's target CPU (aws-lc-sys requires the AES/SHA2
+# feature bits statically); -Wno-elaborated-enum-base keeps the SDK's
+# CF_ENUM/CV_ENUM macros compiling in C++ with non-Apple clang.
+#
+# rustc passes -nodefaultlibs, so the wrapper has to append the Darwin
+# compiler-rt builtins (`__isPlatformVersionAtLeast` behind every `@available`
+# check, e.g. in webrtc-sys' Objective-C++) itself. It prefers Apple's archive
+# when .cnb/cross-build-macos.sh bind-mounts one at /opt/compiler-rt (see its
+# ZED_CROSS_COMPILER_RT) and otherwise uses the archive built from LLVM's
+# source further below.
+RUN set -eux; \
+    llvm_bin="$(clang -print-resource-dir | sed 's#/lib/clang/.*##')/bin"; \
+    for tool in ar ranlib strip nm objcopy lipo install-name-tool; do \
+      ln -sf "$llvm_bin/llvm-$tool" "/usr/local/bin/llvm-$tool"; \
+    done; \
+    ln -sf "$llvm_bin/ld64.lld" /usr/local/bin/ld64.lld; \
+    llvm-ar --version | head -n 1; \
+    ld64.lld --version; \
+    mkdir -p "$(clang -print-resource-dir)/lib/darwin" /opt/compiler-rt; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# clang + ld64.lld driver for aarch64-apple-darwin, used as the Rust' \
+      '# linker and as cc-rs CC/CXX. Also invoked as aarch64-apple-darwin-clang++.' \
+      'set -eu' \
+      'compiler=clang' \
+      'case "$0" in' \
+      '  *++) compiler=clang++; set -- -stdlib=libc++ -Wno-elaborated-enum-base "$@" ;;' \
+      'esac' \
+      '# rustc passes -nodefaultlibs, which stops clang from adding the Darwin' \
+      '# compiler-rt builtins (__isPlatformVersionAtLeast). On link steps append' \
+      '# the archive the host mounted, else the one built from LLVM source.' \
+      'link=1' \
+      'for arg in "$@"; do' \
+      '  case "$arg" in' \
+      '    -c|-S|-E|-M|-MM|-fsyntax-only|--version|-v|-dumpmachine|-print-*|-###) link=0 ;;' \
+      '  esac' \
+      'done' \
+      'if [ "$link" = 1 ]; then' \
+      '  rt=/opt/compiler-rt/libclang_rt.osx.a' \
+      '  [ -f "$rt" ] || rt="$(clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"' \
+      '  [ -f "$rt" ] && set -- "$@" "$rt"' \
+      'fi' \
+      '# ld64.lld only inserts arm64 branch-range thunks inside __TEXT,__text.' \
+      '# zed'"'"'s __text exceeds the 128 MiB bl reach, so the `ctor` constructors' \
+      '# (placed in __TEXT,__text_startup) must be folded into __text to link.' \
+      'if [ "$link" = 1 ]; then' \
+      '  set -- "$@" -Wl,-rename_section,__TEXT,__text_startup,__TEXT,__text' \
+      'fi' \
+      'exec "$compiler" \' \
+      '  --target=arm64-apple-macos \' \
+      '  "-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET:-10.15.7}" \' \
+      '  -isysroot "$SDKROOT" \' \
+      '  "-F$SDKROOT/System/Library/Frameworks" \' \
+      '  -mcpu=apple-m1 \' \
+      '  -fuse-ld=lld \' \
+      '  -Wno-unused-command-line-argument \' \
+      '  "$@"' \
+      > /usr/local/bin/aarch64-apple-darwin-clang; \
+    chmod +x /usr/local/bin/aarch64-apple-darwin-clang; \
+    ln -sf aarch64-apple-darwin-clang /usr/local/bin/aarch64-apple-darwin-clang++; \
+    printf 'int main(void) { return 0; }\n' > /tmp/toolchain-smoke.c; \
+    aarch64-apple-darwin-clang /tmp/toolchain-smoke.c -framework CoreFoundation -lobjc -Wl,-ObjC -Wl,-dead_strip -o /tmp/toolchain-smoke; \
+    file /tmp/toolchain-smoke | grep -q 'Mach-O 64-bit arm64'; \
+    printf '#include <string>\nint main() { std::string s; return (int)s.size(); }\n' > /tmp/toolchain-smoke.cpp; \
+    aarch64-apple-darwin-clang++ -std=c++20 -c /tmp/toolchain-smoke.cpp -o /tmp/toolchain-smoke.o; \
+    rm -f /tmp/toolchain-smoke*
+
+# The only compiler-rt builtin the Darwin link needs beyond Rust's own
+# compiler_builtins is __isPlatformVersionAtLeast. Build it from LLVM's source
+# (Apache-2.0 with LLVM exception), so no Apple archive has to be mounted on
+# the build host; the resulting archive also satisfies clang's own lookup.
+RUN set -eux; \
+    src=/tmp/os_version_check.c; \
+    curl -fsSL -o "$src" "https://raw.githubusercontent.com/llvm/llvm-project/${COMPILER_RT_LLVM_TAG}/compiler-rt/lib/builtins/os_version_check.c"; \
+    printf '%s  %s\n' "$COMPILER_RT_OS_VERSION_CHECK_SHA256" "$src" | sha256sum -c -; \
+    aarch64-apple-darwin-clang -O2 -c "$src" -o /tmp/os_version_check.o; \
+    archive="$(clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"; \
+    llvm-ar rcs "$archive" /tmp/os_version_check.o; \
+    llvm-nm "$archive" | grep -q ' T ___isPlatformVersionAtLeast'; \
+    printf 'int main(void) { if (__builtin_available(macOS 11.0, *)) { return 0; } return 1; }\n' > /tmp/available-smoke.c; \
+    aarch64-apple-darwin-clang /tmp/available-smoke.c -o /tmp/available-smoke; \
+    file /tmp/available-smoke | grep -q 'Mach-O 64-bit arm64'; \
+    rm -f /tmp/os_version_check.* /tmp/available-smoke*
+
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=aarch64-apple-darwin-clang \
+    CC_aarch64_apple_darwin=aarch64-apple-darwin-clang \
+    CXX_aarch64_apple_darwin=aarch64-apple-darwin-clang++ \
+    AR_aarch64_apple_darwin=llvm-ar \
+    RANLIB_aarch64_apple_darwin=llvm-ranlib
+
+# Identity of everything above, copied into each package's .build.json.
+RUN set -eux; \
+    jq -n \
+      --arg base "$DEBIAN_IMAGE" \
+      --arg debian "$(cat /etc/debian_version)" \
+      --arg clang "$(dpkg-query -W -f='${Version}' clang)" \
+      --arg lld "$(dpkg-query -W -f='${Version}' lld)" \
+      --arg protobuf "$(dpkg-query -W -f='${Version}' protobuf-compiler)" \
+      --arg sccache "$(dpkg-query -W -f='${Version}' sccache)" \
+      --arg rustc "$(rustc -V)" \
+      --arg rustup "$RUSTUP_VERSION" \
+      --arg cargo_about "$CARGO_ABOUT_VERSION" \
+      --arg cargo_bundle "$CARGO_BUNDLE_REV" \
+      --arg sdk "$MACOS_SDK_VERSION" \
+      --arg compiler_rt "$COMPILER_RT_LLVM_TAG" \
+      '{base: $base, debian: $debian, clang: $clang, lld: $lld, protobuf: $protobuf, sccache: $sccache, rustc: $rustc, rustup: $rustup, cargo_about: $cargo_about, cargo_bundle_rev: $cargo_bundle, macos_sdk: $sdk, compiler_rt: $compiler_rt}' \
+      > /etc/zed-yolo-toolchain.json; \
+    cat /etc/zed-yolo-toolchain.json

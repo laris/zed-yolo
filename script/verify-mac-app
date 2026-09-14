@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Smoke-test a Zed .app without disturbing any Zed that is already running.
+#
+# Every Zed build shares its process name, and all builds of one release
+# channel share a bundle id and a per-user single-instance TCP port
+# (crates/zed/src/zed/mac_only_instance.rs). A second instance of a running
+# channel therefore just hands off ("zed is already running"), and quitting or
+# killing "Zed" by name reaches every instance, including an IDE that may be
+# hosting an agent session. This script:
+#
+#   * always runs the static checks and the windowless `--system-specs` run;
+#   * launches a window-level instance only when the candidate's channel
+#     (from its bundle id) is not in use, exec'ing the binary directly with its
+#     own --user-data-dir and quitting it through *its* bundle id, which is a
+#     real Cmd+Q-style quit and exercises the crash-handler shutdown;
+#   * with --quit-running, first quits the running Zed(s) of that channel via
+#     their bundle id and relaunches them afterwards. Only do this from a
+#     terminal outside Zed: an agent session hosted by that Zed ends with it.
+#
+# For the side-by-side case build the candidate as another channel, e.g.
+# ZED_CROSS_RELEASE_CHANNEL=dev script/cross-build-remote (MAINTAINING.md §5.5).
+#
+# usage: script/verify-mac-app [--seconds N] [--quit-running] [--keep]
+#                              [--report FILE] "/path/to/Zed Dev.app"
+set -uo pipefail
+
+seconds=40
+quit_running=0
+keep=0
+report=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --seconds) seconds=$2; shift 2 ;;
+    --quit-running) quit_running=1; shift ;;
+    --keep) keep=1; shift ;;
+    --report) report=$2; shift 2 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    *) break ;;
+  esac
+done
+app=${1:?usage: verify-mac-app [options] "/path/to/Zed.app"}
+app=$(cd "$app" && pwd)
+bin="$app/Contents/MacOS/zed"
+test -x "$bin" || { echo "not an app bundle with Contents/MacOS/zed: $app" >&2; exit 2; }
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+failures=0
+pass() { printf 'PASS  %s\n' "$*"; }
+fail() { printf 'FAIL  %s\n' "$*"; failures=$((failures + 1)); }
+info() { printf '      %s\n' "$*"; }
+bundle_id() { /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null; }
+
+identifier=$(bundle_id "$app")
+version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null)
+
+echo "== static checks: $app =="
+info "version $version, identifier $identifier, $(du -sh "$app" | cut -f1)"
+if file "$bin" | grep -q 'Mach-O 64-bit executable arm64'; then pass "Mach-O arm64 executable"; else fail "not a Mach-O arm64 executable: $(file "$bin")"; fi
+info "$(otool -l "$bin" | grep -A4 LC_BUILD_VERSION | awk '/platform|minos|sdk/{printf "%s %s  ", $1, $2}')"
+if python3 "$repo_root/script/check-macho-dylibs.py" "$bin" "$app/Contents/MacOS/cli" >/dev/null 2>&1; then pass "no duplicate dylib load commands"; else fail "duplicate dylib load commands"; fi
+if codesign --verify --deep --strict "$app" >/dev/null 2>&1; then pass "codesign verify ($(codesign -dvv "$app" 2>&1 | awk -F= '/^Signature=/{print $2}'))"; else fail "codesign verify"; fi
+if specs=$("$bin" --system-specs 2>&1) && printf '%s' "$specs" | grep -q '^Zed: v'; then pass "--system-specs: $(printf '%s' "$specs" | grep '^Zed: v' | cut -c1-90)"; else fail "--system-specs: $(printf '%s' "$specs" | head -1)"; fi
+
+# Every running Zed main process as "<pid> <bundle path>". `comm` is the full
+# executable path and bundle paths contain spaces ("Zed Preview.app"), so an
+# awk field test on it silently misses them (that is how the 2026-09-14 run
+# ended up quitting the IDE hosting it); match the whole line instead.
+running_zeds() {
+  # The crash-handler sidecar is the same executable with --crash-handler; it
+  # is not an instance and has no window to quit.
+  local handlers
+  handlers=$(ps -axo pid=,args= | awk '/ --crash-handler /{print $1}' | tr '\n' ' ')
+  ps -axo pid=,comm= | grep -E '/Contents/MacOS/zed$' |
+    sed -E 's#^ *([0-9]+) +(.*)/Contents/MacOS/zed$#\1 \2#' |
+    awk -v handlers=" $handlers" 'index(handlers, " " $1 " ") == 0'
+}
+# PIDs of running instances whose bundle id is $1, excluding PID $2 if given.
+instances_of() {
+  while read -r pid bundle; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "${2:-}" ] && continue
+    [ "$(bundle_id "$bundle")" = "$1" ] && echo "$pid"
+  done < <(running_zeds)
+}
+
+# Running Zed instances that would collide with the candidate's channel.
+conflicting_bundles=()
+while read -r pid bundle; do
+  [ -n "$pid" ] || continue
+  id=$(bundle_id "$bundle")
+  info "running: pid $pid $bundle ($id)"
+  if [ "$id" = "$identifier" ]; then conflicting_bundles+=("$bundle"); fi
+done < <(running_zeds)
+
+relaunch=()
+if [ "${#conflicting_bundles[@]}" -gt 0 ]; then
+  if [ "$quit_running" = 1 ]; then
+    echo "== quitting running $identifier instance(s) =="
+    osascript -e "tell application id \"$identifier\" to quit" >/dev/null 2>&1
+    for _ in $(seq 1 30); do [ -n "$(instances_of "$identifier")" ] && sleep 1 || break; done
+    if [ -n "$(instances_of "$identifier")" ]; then
+      echo "running $identifier instance(s) did not quit: $(instances_of "$identifier" | tr '\n' ' ')" >&2
+      exit 2
+    fi
+    relaunch=("${conflicting_bundles[@]}")
+  else
+    echo "== skipping the window-level run =="
+    info "$identifier is already running (${conflicting_bundles[*]}); a second instance would only hand off to it."
+    info "Build the candidate as another channel (ZED_CROSS_RELEASE_CHANNEL=dev) or rerun with --quit-running from a terminal outside Zed."
+    echo "== verify-mac-app: $app — $failures failure(s), window-level run skipped =="
+    exit $(( failures > 0 ))
+  fi
+fi
+
+echo "== window-level run: ${seconds}s =="
+data_dir=$(mktemp -d /tmp/zed-verify.XXXXXX)
+mkdir -p "$data_dir/config"
+# Keep the throwaway instance quiet: no telemetry, no update checks.
+printf '{\n  "telemetry": { "diagnostics": false, "metrics": false },\n  "auto_update": false\n}\n' > "$data_dir/config/settings.json"
+reports_before=$(mktemp)
+ls ~/Library/Logs/DiagnosticReports/ 2>/dev/null | sort > "$reports_before"
+started=$(date +%s)
+start_stamp=$(date +%Y-%m-%dT%H:%M:%S)
+# Fork builds have no compiled-in minidump endpoint, so without this variable
+# `should_install_crash_handler` never spawns the crash-handler subprocess and
+# the quit below would not touch the code path that the minidumper workaround
+# (§3.6) exists for. Minidumps stay local: uploads need the endpoint.
+ZED_GENERATE_MINIDUMPS=1 "$bin" --user-data-dir "$data_dir" >"$data_dir/stdout.log" 2>&1 &
+pid=$!
+info "pid $pid, data dir $data_dir"
+sleep "$seconds"
+if kill -0 "$pid" 2>/dev/null; then
+  pass "alive after ${seconds}s ($(ps -o etime=,%cpu=,rss= -p "$pid" | tr -s ' ' | sed 's/^ //'))"
+else
+  wait "$pid"; fail "exited early with status $? ($(head -c 200 "$data_dir/stdout.log"))"
+fi
+# macOS logs go to ~/Library/Logs/<app name> regardless of --user-data-dir,
+# shared with other instances; only lines from this launch onwards count.
+log=$(ls -t ~/Library/Logs/Zed*/Zed.log 2>/dev/null | head -1)
+since=$(awk -v s="$start_stamp" '$1 >= s' "$log" 2>/dev/null)
+if printf '%s\n' "$since" | grep -q 'Rendered first frame'; then pass "rendered first frame ($(printf '%s\n' "$since" | grep -m1 'starting zed version' | sed 's/.*starting zed version //; s/ ==.*//' | cut -c1-60))"; else fail "no 'Rendered first frame' after $start_stamp in ${log:-<no log>}"; fi
+# "panic handler registered" is logged at startup; only real panics count.
+panics=$(printf '%s\n' "$since" | grep -ciE 'panicked at|ERROR .*panic'); panics=$(( panics + $(grep -ciE 'panicked at|panic' "$data_dir/stdout.log") ))
+if [ "$panics" -eq 0 ]; then pass "no panics"; else fail "$panics panic mentions"; fi
+info "$(printf '%s\n' "$since" | grep -c ' ERROR ') ERROR lines since launch; first: $(printf '%s\n' "$since" | grep -m1 ' ERROR ' | cut -c1-140)"
+
+# The crash-handler subprocess is a child of this pid running the same binary
+# with --crash-handler; it exits after the main process, and that exit is
+# where the minidumper workaround (§3.6) matters.
+handler=$(ps -axo pid=,ppid=,args= | awk -v parent="$pid" '$2 == parent && /--crash-handler/ {print $1; exit}')
+if [ -n "$handler" ]; then pass "crash handler running (pid $handler)"; else fail "no crash-handler subprocess for pid $pid"; fi
+echo "== quit via bundle id $identifier =="
+others=$(instances_of "$identifier" "$pid" | tr '\n' ' ')
+if ! kill -0 "$pid" 2>/dev/null; then
+  info "the candidate is no longer running; nothing to quit"
+elif [ -n "$others" ]; then
+  # A bundle-id quit is delivered to every instance of that id, so with another
+  # one present the candidate is stopped by PID and the clean-quit check is lost.
+  fail "other $identifier instance(s) running (pid $others); stopping the candidate by PID instead of a bundle-id quit"
+  kill -TERM "$pid"; sleep 3; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid"
+else
+  osascript -e "tell application id \"$identifier\" to quit" >/dev/null 2>&1
+  for _ in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid"; sleep 3; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid"; fail "did not quit within 15s, signalled"; else pass "clean quit"; fi
+fi
+if [ -n "$handler" ]; then
+  sleep 3
+  if kill -0 "$handler" 2>/dev/null; then fail "crash handler $handler still running"; else pass "crash handler $handler exited"; fi
+fi
+sleep 5
+new_reports=$(comm -13 "$reports_before" <(ls ~/Library/Logs/DiagnosticReports/ 2>/dev/null | sort) | grep -i 'zed' || true)
+if [ -z "$new_reports" ]; then pass "no new crash reports in ~/Library/Logs/DiagnosticReports"; else fail "new crash reports: $new_reports"; fi
+rm -f "$reports_before"
+
+for bundle in ${relaunch[@]+"${relaunch[@]}"}; do
+  echo "== relaunching $bundle =="
+  open -a "$bundle"
+done
+
+summary="verify-mac-app: $app — $failures failure(s) in $(( $(date +%s) - started ))s (data dir $data_dir)"
+echo "== $summary =="
+[ -n "$report" ] && printf '%s\n' "$summary" >> "$report"
+if [ "$keep" = 0 ] && [ "$failures" = 0 ]; then rm -rf "$data_dir"; else info "data dir kept: $data_dir"; fi
+exit $(( failures > 0 ))

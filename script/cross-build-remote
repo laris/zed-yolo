@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Two-stage macOS build driver, run on the macOS host:
+#
+#   stage 1  compile aarch64-apple-darwin binaries on a remote x86_64 Linux
+#            Docker host with .cnb/cross-build-macos.sh
+#   stage 2  bundle, sign and (optionally) install them here with
+#            script/bundle-mac -p
+#
+# The commit to build must be reachable on the fork's GitHub repository
+# (pushed to `enhanced`, a `wip/*` branch, or a tag); the remote fetches it by
+# SHA with a shallow fetch, so nothing is transferred from this machine except
+# commands, and the built package comes back over the same SSH path.
+#
+# Environment:
+#   ZED_CROSS_SSH         command prefix that reaches the Linux host and runs
+#                         its arguments there, e.g.
+#                         "ssh build-box" or
+#                         "ssh nano ssh -i ~/.ssh/id_ed25519.bjnbulab2025.pri laris@10.75.71.58"
+#   ZED_CROSS_REMOTE_DIR  checkout directory on the Linux host
+#                         (default ~/src/zed-yolo)
+#   ZED_CROSS_GIT_URL     repository the Linux host fetches from
+#                         (default https://github.com/laris/zed-yolo.git)
+#   ZED_CROSS_REF         commit to build (default: HEAD of this checkout)
+#   ZED_CROSS_IMAGE       docker image tag (default zed-yolo-macos-cross)
+#   ZED_CROSS_COMPILER_RT path *on the Linux host* of the arm64 slice of
+#                         Xcode's libclang_rt.osx.a (see .cnb/cross-build-macos.sh)
+#   ZED_CROSS_RELEASE_CHANNEL
+#                         compile the candidate as this channel (e.g. dev) so it
+#                         can run next to the Zed you are working in (§5.5)
+#   ZED_CROSS_REBUILD_IMAGE
+#                         "1" rebuilds the docker image on the Linux host first
+#                         (after a Dockerfile change)
+#   ZED_CROSS_STAGE       "1", "2" or "all" (default all); stage 2 alone reuses
+#                         the newest package already under dist/
+#   BUNDLE_ARGS           extra script/bundle-mac arguments for stage 2
+#                         (default "-i": install to /Applications; use "" for a DMG)
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+remote_ssh=${ZED_CROSS_SSH:-}
+remote_dir=${ZED_CROSS_REMOTE_DIR:-'~/src/zed-yolo'}
+git_url=${ZED_CROSS_GIT_URL:-https://github.com/laris/zed-yolo.git}
+# Fetching by object id only works with the full 40-hex commit id.
+ref=$(git rev-parse --verify "${ZED_CROSS_REF:-HEAD}^{commit}")
+image=${ZED_CROSS_IMAGE:-zed-yolo-macos-cross}
+stage=${ZED_CROSS_STAGE:-all}
+target=aarch64-apple-darwin
+bundle_args=${BUNDLE_ARGS--i}
+
+# shellcheck disable=SC2086 # the prefix is intentionally word-split
+remote() { $remote_ssh "$@"; }
+
+timings=()
+mark() { timings+=("$1: $(( $(date +%s) - $2 ))s"); }
+
+if [[ "$stage" == "1" || "$stage" == "all" ]]; then
+  test -n "$remote_ssh" || { echo "set ZED_CROSS_SSH to the ssh command prefix for the Linux build host" >&2; exit 2; }
+  echo "== stage 1: cross-compile $ref on the Linux host =="
+  started=$(date +%s)
+  # Git on the Linux host may be too old for shallow fetches by SHA, so every
+  # Git operation there runs inside the cross-build image, which has a modern
+  # Git. The checkout is chowned back to the invoking user afterwards.
+  remote bash -ls <<EOF
+set -euo pipefail
+mkdir -p $remote_dir
+cd $remote_dir
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  echo "docker image $image is missing on the Linux host; build it first with" >&2
+  echo "  docker build -t $image -f .cnb/Dockerfile.zed-macos .cnb" >&2
+  exit 1
+fi
+rgit() {
+  docker run --rm --user 0:0 -v "\$PWD:/workspace" -w /workspace \\
+    -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \\
+    "$image" git "\$@"
+}
+if [ ! -d .git ]; then
+  rgit init -q .
+  rgit remote add origin "$git_url"
+fi
+rgit fetch --depth 1 --no-tags origin "$ref"
+rgit checkout -q --detach FETCH_HEAD
+rgit rev-parse HEAD
+docker run --rm --user 0:0 -v "\$PWD:/workspace" -w /workspace "$image" chown -R "\$(id -u):\$(id -g)" /workspace
+ZED_CROSS_IMAGE="$image" ${ZED_CROSS_COMPILER_RT:+ZED_CROSS_COMPILER_RT="$ZED_CROSS_COMPILER_RT"} ${ZED_CROSS_RELEASE_CHANNEL:+ZED_CROSS_RELEASE_CHANNEL="$ZED_CROSS_RELEASE_CHANNEL"} ${ZED_CROSS_REBUILD_IMAGE:+ZED_CROSS_REBUILD_IMAGE="$ZED_CROSS_REBUILD_IMAGE"} bash .cnb/cross-build-macos.sh
+EOF
+  mark "stage 1 (remote)" "$started"
+
+  echo "== fetching the stage-1 package =="
+  started=$(date +%s)
+  mkdir -p dist
+  # The driver records the package basename; a login shell's `ls` may be an
+  # alias with a long format, so never parse listings over SSH.
+  package_name=$(remote "cat $remote_dir/dist/LATEST" | tail -n 1 | tr -d '\r')
+  test -n "$package_name"
+  for suffix in "" .sha256 .build.json; do
+    remote "cat $remote_dir/dist/$package_name$suffix" > "dist/$package_name$suffix"
+  done
+  # The checksum file names the tarball as dist/<name>, relative to the repo root.
+  shasum -a 256 -c "dist/$package_name.sha256"
+  cat "dist/$package_name.build.json"
+  mark "transfer ($(du -h "dist/$package_name" | cut -f1))" "$started"
+fi
+
+if [[ "$stage" == "2" || "$stage" == "all" ]]; then
+  echo "== stage 2: bundle on this macOS host =="
+  started=$(date +%s)
+  # shellcheck disable=SC2012 # names are controlled by package_target
+  package=$(ls -t dist/zed-yolo-v*-"$target"-*.tar.zst | head -n 1)
+  test -n "$package"
+  package_dir="dist/$(basename "$package" .tar.zst)"
+  rm -rf "$package_dir"
+  tar -C dist -xf "$package"
+  test -f "$package_dir/zed"
+  # shellcheck disable=SC2086 # BUNDLE_ARGS is a user-supplied argument list
+  script/bundle-mac -p "$package_dir" $bundle_args "$target"
+  mark "stage 2" "$started"
+fi
+
+printf '[timing] %s\n' "${timings[@]}"

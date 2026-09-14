@@ -1,0 +1,9 @@
+# Buttons on the branch pages of cnb.cool/lary.me/zed-yolo (BUILDING.md §2.2).
+branch:
+  - buttons:
+      - name: Cross-build this commit
+        description: Start the zed-yolo-cross-build workspace on the tip of this branch
+        event: web_trigger_cross_build
+        openWorkspace: false
+        permissions:
+          roles: [owner]

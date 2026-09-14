@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Collect the macOS release assets produced by stage 2 in DMG mode
+# (BUNDLE_ARGS='' script/cross-build-remote) into dist/release/<tag>/:
+#
+#   Zed-<Channel>-aarch64.tar.gz (+ .sha256)   the .app, tarred to keep its
+#                                              ad-hoc signature and symlinks
+#   Zed-aarch64.dmg                            upstream's DMG name
+#   zed-remote-server-macos-aarch64.gz (+ .sha256), when bundle-mac produced it
+#
+# usage: script/release-mac-assets --tag TAG ["/path/to/Zed Preview.app"]
+set -euo pipefail
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+tag=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tag) tag=$2; shift 2 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) break ;;
+  esac
+done
+test -n "$tag" || { echo "--tag is required" >&2; exit 2; }
+target=aarch64-apple-darwin
+app=${1:-target/$target/release/dmg/Zed Preview.app}
+test -d "$app" || { echo "no bundle at $app; run stage 2 in DMG mode first" >&2; exit 1; }
+dmg=target/$target/release/Zed-aarch64.dmg
+remote_gz=target/zed-remote-server-macos-aarch64.gz
+
+out="dist/release/${tag//\//-}"
+mkdir -p "$out"
+app_name=$(basename "$app" .app)          # "Zed Preview"
+asset_stem=${app_name// /-}               # "Zed-Preview"
+tar -C "$(dirname "$app")" -czf "$out/$asset_stem-aarch64.tar.gz" "$(basename "$app")"
+if [ -f "$dmg" ]; then cp "$dmg" "$out/Zed-aarch64.dmg"; else echo "note: no DMG at $dmg" >&2; fi
+if [ -f "$remote_gz" ]; then cp "$remote_gz" "$out/"; else echo "note: no $remote_gz" >&2; fi
+(cd "$out" && for f in *.tar.gz *.gz; do [ -f "$f" ] && shasum -a 256 "$f" > "$f.sha256"; done)
+ls -lh "$out"
+echo "$out"
