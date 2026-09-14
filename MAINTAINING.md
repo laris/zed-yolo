@@ -422,6 +422,21 @@ a conflict because it still applies mechanically. The source-base comment and
 attachment release version in `.cnb.yml` are checkpoint metadata and must be
 updated deliberately; see §4.3.2 and §5.2.
 
+The cross-compilation shims all follow one rule: **a build script must gate
+macOS behaviour on the compilation target, not on the host.** `#[cfg(target_os
+= "macos")]` and `cfg!(target_os = "macos")` inside `build.rs` describe the
+machine running the build script, so a Linux host silently skips them. The
+fork replaces them with `std::env::var("CARGO_CFG_TARGET_OS") == "macos"` and
+lets `xcrun` be answered by the container's shim (§5.4). Files carrying the
+shim as of v1.20.0-pre: `crates/gpui_apple/build.rs` (moved by upstream from
+`gpui_macos` in v1.16), `crates/media/build.rs` (also honours `SDKROOT`
+directly), and — added by the two-stage build work — `crates/zed/build.rs`
+(`-ObjC`, weak frameworks, Swift rpath), `crates/cli/build.rs` (deployment
+target) and `crates/ui/build.rs` (`macos_sdk_26_or_later`, which selects the
+macOS 26 title-bar traffic-light padding). When upstream adds another
+`build.rs` with a host-gated macOS branch, extend the shim rather than
+accepting a cross-build that quietly differs from the native one.
+
 ### 3.5 Fixture completeness (folded into patch #1)
 
 A standalone `agent, agent_ui: Add enhanced_yolo to test fixtures` commit
@@ -433,10 +448,14 @@ standalone fixture commit.
 
 ### 3.6 The minidumper workaround (patch #5)
 
-`minidumper 0.9`'s `Server::drop` calls `mach_port_deallocate` on a
-kernel-guarded Mach port, which raises `EXC_GUARD/INVALID_RIGHT` and SIGKILLs
-the crash-handler subprocess on every quit. Symptom: "Zed quit unexpectedly"
-dialog despite a clean quit.
+Dropping `minidumper`'s `Server` drops the `crash_context::ipc::Server` it
+owns, whose `Drop` calls `mach_port_deallocate(mach_task_self(), self.port)`
+on a kernel-guarded Mach port (`crash-context/src/mac/ipc.rs`; the same
+pattern exists in `AckReceiver::drop`). That raises `EXC_GUARD/INVALID_RIGHT`
+and SIGKILLs the crash-handler subprocess on every quit. Symptom: "Zed quit
+unexpectedly" dialog despite a clean quit. The call lives in `crash-context`,
+not in `minidumper`'s own `src/ipc/*.rs`, so a `minidumper` version bump alone
+proves nothing.
 
 The patch leaks the `Server` via `std::mem::forget` on macOS only. The
 subprocess exits immediately after, so the kernel reclaims the port — no real
@@ -445,9 +464,16 @@ leak in practice.
 **Removal criteria:** delete this commit during the next upstream upgrade if:
 
 - PR #57951 (or any equivalent fix) has been merged upstream, **or**
-- `minidumper` has been bumped to a version that no longer calls
-  `mach_port_deallocate` from `Drop`. (Verify with
-  `grep -nC2 'mach_port_deallocate' $(cargo metadata --format-version=1 | jq -r '.packages[] | select(.name == "minidumper") | .manifest_path | sub("Cargo.toml$"; "src")')/ipc/*.rs`.)
+- the `crash-context` version selected by `Cargo.lock` no longer calls
+  `mach_port_deallocate` from a `Drop` impl. Verify against the crate that
+  the lockfile actually resolves, after `cargo fetch`:
+  ```bash
+  grep -A1 -E '^name = "(minidumper|crash-context)"$' Cargo.lock
+  grep -rn -B4 'mach_port_deallocate' "$(cargo metadata --format-version=1 --offline \
+    | jq -r '.packages[] | select(.name == "crash-context") | .manifest_path | sub("Cargo.toml$"; "src")')"
+  ```
+  Checked 2026-09-14: `v1.20.0-pre` resolves minidumper 0.11.0 → crash-context
+  0.8.0, which still has both calls, so the workaround stayed.
 
 ### 3.7 Local modifications to `script/bundle-mac`
 
@@ -461,15 +487,16 @@ compaction folded into the same patch.
 | A | Block after `rustup target add` (≈line 86)  | Detects whether the host has Xcode's `metal` compiler. If not (Command Line Tools only, or a Linux CNB host), exports the `gpui_platform/runtime_shaders` feature so the build does not try AOT shader compilation. |
 | B | The three `cargo build` / `cargo bundle` call sites | Use the `${zed_features[@]+"${zed_features[@]}"}` idiom instead of the plain `"${zed_features[@]}"`. Required because `set -u` (which the script enables) errors on empty-array expansion under bash 3.2 — the bash that ships on the GitHub-hosted `macos-latest` runner. |
 | C | New function `copy_enhanced_remote_servers` + call site | Copies pre-built `dist/zed-remote-server-linux-*.gz` (or `target/...`) into `Contents/Resources/remote_servers/` inside the bundled `.app`. Same set-u-safe array expansion as B. |
+| D | `-p DIR` option (getopts, `prebuilt_dir` checks, the `if [[ -n "${prebuilt_dir}" ]]` branch around the two `cargo build` calls, the `dsymutil` skip, the trailing cleanup) | Stage 2 of the two-stage build (§5.4, added 2026-09-14): validates and copies prebuilt `zed`/`cli`/`remote_server` into `target/<triple>/release/`, exports `CARGO_BUNDLE_SKIP_BUILD=true` so `cargo bundle` only assembles the `.app`, skips `generate-licenses` and `dsymutil`, and removes the copies afterwards so the next native `cargo build` relinks instead of trusting them. Also makes `-i` skip DMG creation, because upstream's script tries to package the bundle it has just moved into `/Applications`. |
 
 **Tracking discipline:**
 
 - Every time you upgrade upstream, diff our script against the new
-  upstream version and confirm A/B/C still apply cleanly:
+  upstream version and confirm A/B/C/D still apply cleanly:
   ```bash
   git diff "$NEW"..enhanced -- script/bundle-mac
   ```
-  The diff should be a strict superset of the three blocks above. If
+  The diff should be a strict superset of the four blocks above. If
   upstream has refactored the script, you may need to relocate one or
   more blocks during the rebase.
 - If upstream **adds the runtime-shader fallback** itself (block A
@@ -624,9 +651,12 @@ git rebase --abort
 
 | Patch              | File                                              | Conflict pattern                                                                                                 |
 | ------------------ | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `enhanced YOLO`    | `crates/agent_servers/src/acp.rs`                 | `use gpui::{…}` import gains a new symbol upstream while we add `use settings::Settings as _;`. Merge both. |
+| `enhanced YOLO`    | `crates/agent_servers/src/acp.rs`                 | `use gpui::{…}` import gains a new symbol upstream. Since 2026-09-14 the patch no longer imports `settings::Settings` at module level (it qualifies the single `get_global` call), because a module-level `as _` import reaches upstream's `mod tests` through `use super::*` and turns upstream's own import into an unused-import warning. |
 | `enhanced YOLO`    | `crates/agent_settings/src/agent_settings.rs`     | Other authors add fields to `AgentSettings`; preserve `pub enhanced_yolo: EnhancedYoloSettings,`. |
 | `test fixtures`    | `crates/agent/src/tool_permissions.rs`, `crates/agent_ui/src/agent_ui.rs` | Preserve our `enhanced_yolo` fixture fields while accepting new upstream fields. |
+| `project manager`  | `assets/settings/default.json`, `crates/settings_content/src/workspace.rs`, `crates/workspace/src/workspace_settings.rs` | Upstream adds a workspace setting at the same insertion point (`reveal_if_open` in v1.20.0-pre). Keep both, upstream's field first, in the struct, the `from_settings` constructor, and the defaults JSON. |
+| `CNB infra`        | `crates/gpui_apple/build.rs` (was `crates/gpui_macos/build.rs`) | Upstream moved the Metal/cbindgen build script into the new `gpui_apple` crate (v1.16+); Git follows the rename. Keep the fork's runtime `CARGO_CFG_TARGET_OS` gate on `main()` and on the module; take upstream's `find_gpui_crate_dir`, which now resolves `../gpui` itself. Upstream also dropped the `gpui` build-dependency, so the fork no longer touches `gpui_macos/Cargo.toml`; the un-gated `cbindgen` build-dependency now belongs in `gpui_apple/Cargo.toml`. |
+| `CNB infra`        | `script/bundle-mac`                               | Upstream changed the two `cargo build` lines to `cargo --config .cargo/bundle-config.toml build …` (v1.20.0-pre). Keep upstream's prefix and re-append the fork's set-u-safe `${zed_features[@]+…}` suffix (§3.7 block B). |
 | `CNB infra`        | `.cnb.yml`                                        | Keep fork-owned CI and update the source baseline and release tag to `$NEW`. |
 
 #### 4.3.2 Update version strings inside the CNB patch
@@ -721,18 +751,34 @@ CNB traffic cannot use the GitHub proxy, so all promised objects needed for
 the CNB update must be materialized first under `$GH`.
 
 The following helper enumerates only objects reachable from the new ref but
-not from the old CNB ref. `git cat-file --batch-check` has been verified on
-this clone to lazily fetch promised blobs:
+not from the old CNB ref, then requests every missing object in one batched
+fetch. This is the same command Git runs internally for a lazy fetch, except
+that all OIDs are passed on stdin at once instead of one fetch per object
+(the earlier `git cat-file --batch-check` loop did one round trip per blob and
+needed >10 minutes for a single week of upstream delta; the batched form
+fetched the 2,267 blobs of a five-week delta in 11 seconds). A bare OID is a
+valid refspec, and GitHub serves blob wants for partial clones; `--filter`
+does not drop explicitly wanted blobs:
 
 ```bash
 hydrate_delta() {
   INCLUDE=$1
   EXCLUDE=$2
+  REMOTE=${3:-upstream}   # github for fork-only commits, upstream otherwise
 
+  MISSING=$(mktemp)
   git rev-list --objects --missing=print "$INCLUDE" "^$EXCLUDE" |
-    awk '/^\?/ {sub(/^\?/, "", $1); print $1}' |
-    $GH git cat-file --batch-check='%(objectname) %(objecttype)' \
-      >/dev/null
+    awk '/^\?/ {print substr($1, 2)}' >"$MISSING"
+  echo "missing objects for $INCLUDE: $(wc -l <"$MISSING")"
+
+  if [ -s "$MISSING" ]; then
+    split -l 2000 "$MISSING" "$MISSING.chunk."
+    for CHUNK in "$MISSING".chunk.*; do
+      $GH git -c fetch.negotiationAlgorithm=noop fetch \
+        --no-tags --no-write-fetch-head --recurse-submodules=no \
+        --filter=blob:none --stdin "$REMOTE" <"$CHUNK"
+    done
+  fi
 
   if git rev-list --objects --missing=print "$INCLUDE" "^$EXCLUDE" |
        grep -q '^?'; then
@@ -742,15 +788,24 @@ hydrate_delta() {
 }
 
 hydrate_delta "$NEW_MAIN" "$OLD_CNB_MAIN"
-hydrate_delta refs/heads/enhanced "$OLD_CNB_ENHANCED"
+hydrate_delta refs/heads/enhanced "$OLD_CNB_ENHANCED" github
 for TAG in "${NEW_RELEASE_TAGS[@]}"; do
   hydrate_delta "refs/tags/$TAG" "$OLD_CNB_MAIN"
 done
 ```
 
+Run the `$NEW` hydration **before** the rebase as well: the checkout of the new
+baseline then needs no lazy fetches at all, which also removes the mid-rebase
+`fetch-pack` disconnects seen at earlier checkpoints.
+
 This is the step that makes the partial-clone bridge reliable: GitHub supplies
 only the missing release delta through the proxy, then CNB receives that same
 small delta without ever contacting GitHub during the CNB push.
+
+Never run `git log -G`, `-S`, or `-p` across an upstream range in this clone:
+every blob in the range is lazily fetched one at a time and the command can
+run for hours. Use `git diff --stat A B -- <paths>`, `git show REV:<path>`, or
+`git log -- <path>` (no content search) instead.
 
 ### 4.7 Publish the same explicit refs to CNB
 
@@ -838,7 +893,22 @@ Known script quirks (do not "fix" without understanding):
 Driven by `.cnb.yml` + `.cnb/Dockerfile.zed-macos`. The current `$: vscode`
 definition is a manually started CNB workspace build; there is no Git-tag
 trigger in this file. The pipeline produces unsigned macOS Mach-O binaries;
-signing/notarization happens later locally or in a rcodesign stage.
+signing/notarization happens later locally (§5.4 stage 2) or in a rcodesign
+stage.
+
+The image (`ghcr.io/rust-cross/cargo-zigbuild` base) pins Rust 1.97.1, the
+MacOSX26.1 SDK from `joseluisq/macosx-sdks`, `cargo-about` and the Zed
+`cargo-bundle`, and adds an `xcrun` shim that answers `--show-sdk-path` and
+`--show-sdk-version` from `$SDKROOT`. Since 2026-09-14 Darwin targets are
+compiled and linked by Debian clang + LLVM `ld64.lld` through the
+`aarch64-apple-darwin-clang{,++}` wrappers (selected via
+`CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`, `CC_/CXX_/AR_aarch64_apple_darwin`),
+not by zig; `cargo zigbuild` remains only for the Linux remote-server targets.
+`.cnb/run-zed-build-step.sh build` picks `cargo build` or `cargo zigbuild`
+from the target triple. The Darwin link additionally needs Apple's compiler-rt
+archive mounted into the container (§5.4); the CNB pipeline does not provide
+it yet, so its Darwin link step fails on `__isPlatformVersionAtLeast` until a
+CNB secret or asset supplies the file.
 
 The `RELEASE_TAG` value names the CNB attachment release populated by
 `cnbcool/attachments`. Keep its established `zed-yolo-$NEW-enhanced` form in
@@ -856,6 +926,124 @@ slash-containing attachment tags are tested. See §4.3.2.
 Both share the bundle identifier `dev.zed.Zed-Preview`, so macOS may
 arbitrate `zed://` URL handling. For predictable URL routing, use Finder →
 right-click → Get Info → "Open with" → choose the preferred app → "Change All".
+
+### 5.4 Two-stage build: Linux cross-compile, macOS finish
+
+Added 2026-09-14. Compilation (the part that takes ~2.5 h on the GitHub macOS
+runner, or the better part of an hour on the 8-core laptop) runs inside the
+CNB cross-build container on a many-core x86_64 Linux Docker host; only
+bundling, signing and installation run on the Mac. Everything is driven from
+the Mac by `script/cross-build-remote`; the pieces are:
+
+| Piece | Runs on | Does |
+| ----- | ------- | ---- |
+| `.cnb/Dockerfile.zed-macos` | Linux (once) | The cross toolchain image; §5.2. |
+| `.cnb/cross-build-macos.sh` | Linux, per build | Runs the container as root with named volumes for the cargo registry, cargo git, sccache and `target/`; bind-mounts the checkout at `/workspace` and Apple's compiler-rt at `/opt/compiler-rt/`; executes `run-zed-build-step.sh` `macho-smoke` → `generate-licenses` → `metadata` → `build … zed-cli` → `build … remote-server` → `package … all`; chowns `dist/` back. Output: `dist/zed-yolo-v<ver>-aarch64-apple-darwin-<yyyymmdd>-g<sha8>.tar.zst` (+ `.sha256`, `.build.json`) containing `zed`, `cli`, `remote_server`. |
+| `script/cross-build-remote` | Mac | Stage 1: shallow-fetches the commit by full SHA on the Linux host (Git runs inside the image; the host's Git may be too old), runs the driver, streams the package back over the same SSH path and checks its SHA-256. Stage 2: extracts it and calls `script/bundle-mac -p`. |
+| `script/bundle-mac -p DIR` | Mac | §3.7 block D: validates the Mach-O load commands, copies the three binaries into `target/aarch64-apple-darwin/release/`, sets `CARGO_BUNDLE_SKIP_BUILD=true` so `cargo bundle` only assembles the `.app`, then runs upstream's unchanged tail: `Document.icns`, dugite `git`, provisioning profile, ad-hoc `codesign` with entitlements, `-i` install or DMG, remote-server gzip. `dsymutil` is skipped (the object files live on the Linux host); `strip -x` still runs for non-`-i` builds. |
+
+The build scripts' host-vs-target shims (§3.4) and the un-gated `cbindgen`
+build-dependency in `crates/gpui_apple/Cargo.toml` are what make the
+cross-built binaries equivalent to native ones; without them the Linux build
+silently drops `-ObjC`, the weak frameworks and the SDK-26 title-bar layout.
+
+#### 5.4.1 One-time setup
+
+On the Linux host you need Docker usable by your user and outbound access to
+GitHub, `static.crates.io`, `ghcr.io`, `ziglang.org` and `deb.debian.org`.
+The host kernel does not matter (validated on CentOS 7 / kernel 3.10 with
+Docker 26.1); the image is Debian trixie and brings its own glibc. Budget
+~9 GB for the image, ~30 GB for the `target` volume and up to 80 GB for
+sccache.
+
+```bash
+# The SSH prefix that reaches the Linux host and runs its arguments there.
+# Two hops are fine; the key for the second hop may live on the first host.
+export ZED_CROSS_SSH='ssh -o BatchMode=yes nano ssh -o BatchMode=yes -i ~/.ssh/id_ed25519.bjnbulab2025.pri laris@10.75.71.58'
+
+# 1. Build the image (~10 min; self-contained, needs no build context).
+$ZED_CROSS_SSH 'mkdir -p ~/zed-yolo-cross && cat > ~/zed-yolo-cross/Dockerfile.zed-macos' \
+  < .cnb/Dockerfile.zed-macos
+$ZED_CROSS_SSH 'cd ~/zed-yolo-cross && docker build -t zed-yolo-macos-cross -f Dockerfile.zed-macos .'
+
+# 2. Ship the arm64 slice of Xcode's Darwin compiler-rt (248 KB). It provides
+#    __isPlatformVersionAtLeast, which every Objective-C `@available` check
+#    (webrtc-sys) calls; Rust's compiler_builtins does not, Apple's clang links
+#    it natively, and Apple's licence keeps it out of the image and the repo.
+lipo -thin arm64 "$(dirname "$(xcrun --find clang)")/../lib/clang/"*/lib/darwin/libclang_rt.osx.a \
+  -output /tmp/libclang_rt.osx.a
+$ZED_CROSS_SSH 'mkdir -p ~/.cache/zed-yolo-cross && cat > ~/.cache/zed-yolo-cross/libclang_rt.osx.a' \
+  < /tmp/libclang_rt.osx.a
+```
+
+When the tool shell is zsh (the agent harness), spell the prefix out literally
+in commands instead of `$ZED_CROSS_SSH …`: zsh does not word-split an unquoted
+variable. Bash scripts, including `script/cross-build-remote`, are unaffected.
+
+#### 5.4.2 Every build
+
+```bash
+# The commit must be reachable on GitHub (enhanced, a wip/* branch, or a tag);
+# the Linux host fetches it by SHA and nothing but commands leave the Mac.
+$GH git push github 'refs/heads/wip/<topic>:refs/heads/wip/<topic>'   # if not on enhanced yet
+
+$GH script/cross-build-remote                 # stage 1 + stage 2, installs /Applications/Zed Preview.app
+ZED_CROSS_STAGE=1 $GH script/cross-build-remote   # only fetch the package into dist/
+BUNDLE_ARGS='' ZED_CROSS_STAGE=2 $GH script/cross-build-remote   # only bundle the newest dist/ package, producing the DMG
+```
+
+`$GH` is required on the Mac side because `script/bundle-mac` downloads the
+dugite `git` binary from GitHub. Delete a `wip/*` branch from GitHub (and mirror
+or delete it on CNB) once its commits are on `enhanced`; §2.5's parity proof
+lists it otherwise.
+
+Then smoke-test as in §4.4 and, if the build replaces the daily install,
+follow §5.3. `codesign --verify --deep --strict`, `otool -l | grep -A4
+LC_BUILD_VERSION` (platform 1 = macOS, minos 11.0, sdk 26.1),
+`Contents/MacOS/zed --system-specs` (loads every framework and runs the static
+constructors without opening a window) and a clean quit without a new
+`~/Library/Logs/DiagnosticReports/Zed*` report are the checks that distinguish
+a healthy cross-built app from a merely linkable one.
+
+Two constraints when the smoke test runs from an agent session hosted by Zed
+itself:
+
+- Zed's single-instance lock is a per-user TCP port derived from the release
+  channel (`crates/zed/src/zed/mac_only_instance.rs`), not from the data
+  dir, so a second Preview instance always hands off with "zed is already
+  running" — `--user-data-dir` does not isolate it. A window-level test of a
+  new build needs the hosting Zed to be quit first, by the operator.
+- Never quit or kill Zed by name or bundle id (`osascript … "Zed Preview"`,
+  `pkill -f zed`, `killall`); every build shares them and the command reaches
+  the hosting IDE. Stop test processes by PID only, and do not `-i`-install
+  over the bundle a running instance was launched from (check
+  `ps -axo pid,comm | grep MacOS/zed`).
+
+Measured on 2026-09-14 (r740-09: 2× Xeon Silver 4216, 64 threads, 125 GiB;
+cold volumes): image build 10 min; first stage 1 ≈ 20 min compile + 6 min
+link for `zed`+`cli`, 15 min more for `remote_server` (`build.json` reports
+1,272 s for the whole Darwin build with warm dependencies); an incremental
+relink after a build-script change ≈ 6 min; the 108 MB package crossed the two
+SSH hops in about a minute; stage 2 took 15 s with `-i` and 50 s with the DMG.
+Compare with 3 h 28 min for the same tag's `bundle_mac_aarch64` job on the
+GitHub runner.
+
+#### 5.4.3 Why the toolchain looks the way it does
+
+Every line below cost one failed build; keep them until the cause is gone.
+
+| Symptom | Cause | Where it is handled |
+| ------- | ----- | ------------------- |
+| `zig cc`: `failed to create path 'z' in local cache directory: Unexpected` | zig ≥ 0.14 uses `statx(2)` for its cache; kernel 3.10 returns `ENOSYS`, which zig reports as `Unexpected`. | Darwin uses clang + `ld64.lld` (Dockerfile); zig only for Linux targets. |
+| zig 0.14/0.15: `zig installation bug: unable to parse SDK version` | SDK 26 version string. | Same. |
+| zig ≤ 0.13: `undefined symbol: section$end$__DATA$_CTOR0_ISIZE_FN` | zig's Mach-O linker gained `section$start/end` (used by `ctor 1.0`) only in 0.14. | Same. |
+| `aws-lc-sys`: `#error "NEON and crypto extensions should be statically available."` | C compiler defaults to a generic arm64 CPU; rustc assumes `apple-m1`. | Wrapper passes `-mcpu=apple-m1`. |
+| C++ against SDK headers: `non-defining declaration of enumeration with a fixed underlying type …` | Non-Apple clang promotes `-Welaborated-enum-base` to an error in `CF_ENUM`. | `aarch64-apple-darwin-clang++` passes `-Wno-elaborated-enum-base`. |
+| `gpui_apple` build script: `unresolved import cbindgen` | Cargo evaluates `[target.'cfg(target_os = "macos")'.build-dependencies]` against the build host. | Un-gated `[build-dependencies]` in `crates/gpui_apple/Cargo.toml`. |
+| `ld64.lld: undefined symbol: __isPlatformVersionAtLeast` | compiler-rt builtin behind `@available`; rustc passes `-nodefaultlibs`, so clang never adds `libclang_rt.osx.a`; Rust's `compiler_builtins` lacks it. | Wrapper appends the mounted `/opt/compiler-rt/libclang_rt.osx.a` on link steps. |
+| `ld64.lld: relocation BRANCH26 is out of range … references core::…` in `__ctor_private` | lld only inserts arm64 branch thunks inside `__TEXT,__text`; `zed`'s `__text` is ~220 MB (> 128 MiB `bl` reach) and `ctor` code sits in `__TEXT,__text_startup`. Apple's ld64 uses branch islands. | Wrapper passes `-Wl,-rename_section,__TEXT,__text_startup,__TEXT,__text`. |
+| `fatal: couldn't find remote ref <short sha>` on the Linux host | Fetching by object id needs the full 40-hex id. | `script/cross-build-remote` resolves `^{commit}`. |
+| Package tarball owned by root on the Linux host | Container runs as root like the CNB runner. | Driver chowns `dist/` and `assets/` back on exit. |
 
 ---
 
@@ -1052,10 +1240,11 @@ $GH git fetch --filter=blob:none --no-tags upstream \
 $GH git fetch --filter=blob:none --no-tags upstream \
   refs/tags/<NEW>:refs/tags/<NEW>
 
-# 3. Inspect, archive, rebase, and test.
+# 3. Inspect, archive, hydrate the new baseline's blobs (§4.6), rebase, test.
 git log --reverse --oneline '<PREV>^{commit}..enhanced'
 git tag -a archive/enhanced/<PREV>-YYYYMMDD-HHMMSS enhanced \
   -m 'Pre-rebase rollback'
+hydrate_delta '<NEW>^{commit}' <OLD_CNB_MAIN>
 git rebase --onto '<NEW>^{commit}' '<PREV>^{commit}' enhanced
 $GH cargo check --workspace --all-targets
 $GH script/bundle-mac -d -i aarch64-apple-darwin
@@ -1082,6 +1271,7 @@ diff -u /tmp/zed.github.refs /tmp/zed.cnb.refs
 
 | Date       | From          | To             | Notes                                                                                                |
 | ---------- | ------------- | -------------- | ---------------------------------------------------------------------------------------------------- |
+| 2026-09-14 | `v1.15.0-pre` | `v1.20.0-pre`  | Mirrored all 18 releases published 2026-08-12…09-09 (`v1.15.0`, `v1.16.0-pre`, `v1.16.1-pre`, `v1.15.1`, `v1.16.1`, `v1.17.0-pre`, `v1.17.1-pre`, `v1.16.2`, `v1.17.2-pre`, `v1.16.3`, `v1.17.2`, `v1.18.0-pre`, `v1.19.0-pre`, `v1.18.0`, `v1.19.1-pre`, `v1.18.1`, `v1.19.2`, `v1.20.0-pre`); `v1.20.0-pre` is the newest by `published_at` (24 s after `v1.19.2`), new 1.20 line → non-linear ancestry (merge-base on upstream `main`, 473 commits behind the new tag, 1 PREV-only) passed manual review. Rollback tag `archive/enhanced/v1.15.0-pre-20260914-005305`. 9-commit stack (no compaction). Conflicts in patch #3 (upstream's `reveal_if_open` at the scaffold's insertion points, kept both) and patch #4 (`gpui_macos/build.rs` renamed upstream to `gpui_apple/build.rs`, `bundle-mac` gained `--config .cargo/bundle-config.toml`; see §4.3.1). Patch #1 amended to qualify its one `Settings::get_global` call instead of importing the trait, which had made upstream's `mod tests` import an unused-import warning. Toolchain moved to Rust 1.97.1; `cargo check --workspace --all-targets --features gpui_platform/runtime_shaders` clean (Metal Toolchain still absent locally). minidumper 0.11.0 → crash-context 0.8.0 still calls `mach_port_deallocate` in `Server::drop` → **patch #5 kept**, §3.6 corrected. Batched promised-object hydration (§4.6) fetched the 2,267-blob delta in 11 s. Release published by GitHub Actions from `enhanced/v1.20.0-pre` (all 8 assets; `bundle_mac_aarch64` took 3 h 28 min). Mirrored release tags also queued 18 runs of upstream's `release.yml` in the fork; force-cancelled (§11.1). Follow-up on `enhanced` the same day: the two-stage Linux-cross-compile/macOS-finish build (§5.4), validated end-to-end on `mtbc-r740-09` (CentOS 7, Docker) except for a window-level session, which the operator runs. |
 | 2026-08-07 | `v1.14.1-pre` | `v1.15.0-pre`  | Mirrored `v1.14.2-pre`, `v1.13.2`, `v1.14.2`, and `v1.15.0-pre` (published 2026-08-02/05). Executed the §12.3 compaction on the old baseline first: **15 commits → 7**, proven tree-identical to `archive/enhanced/v1.14.1-pre-20260807-211019` — the codex elicitation auto-accept folded into patch #1, the Linux aarch64 CI job folded into the consolidated CI commit, and five per-checkpoint history commits folded into the docs commit. Rebase onto `v1.15.0-pre` applied with zero conflicts (new 1.15 line → non-linear ancestry, merge-base on upstream `main`, 96 commits behind the new tag; the 3 PREV-only commits are 1.14-branch bumps/cherry-picks). Two transient local Git faults (a lazy-blob `fetch-pack` disconnect and an `index.lock` collision that interrupted a pick mid-step, leaving the minidumper patch staged) were recovered by committing the identical staged patch with `-C` and continuing; the net fork diff stayed byte-identical at 25 files, +2924/−54. minidumper still 0.9.0 → workaround kept. Verified with `--features gpui_platform/runtime_shaders`. Release published by GitHub Actions from tag `enhanced/v1.15.0-pre`. |
 | 2026-07-30 | `v1.12.0-pre` | `v1.14.1-pre`  | Mirrored `v1.12.0`, `v1.13.0-pre`, `v1.13.1-pre`, `v1.12.1`, `v1.13.1`, and `v1.14.1-pre` (published 2026-07-23…29; upstream published no `v1.14.0-pre`). `v1.14.1-pre` is the newest release by `published_at`; new 1.14 line → non-linear ancestry (merge-base on upstream `main`, 281 commits behind the new tag) passed manual review. One conflict in patch #4: upstream switched `gpui_macos`'s `cbindgen` build-dependency to a workspace dep; kept the fork's un-gated `[build-dependencies]` without the `gpui` build-dep (fork `build.rs` reads gpui *sources* for cbindgen instead of linking it) while adopting `cbindgen.workspace = true`. Remaining 13 commits incl. the codex elicitation auto-accept applied cleanly; its unit test re-ran green. minidumper still 0.9.0 → workaround kept. Verified with `--features gpui_platform/runtime_shaders`. Release published by GitHub Actions from tag `enhanced/v1.14.1-pre`. Stack is now 15 commits — execute the §12.3 compaction at the next baseline rebase. |
 | 2026-07-18 | `v1.12.0-pre` | `v1.12.0-pre`  | Fork fix, no baseline change: extended patch #1 so enhanced YOLO also auto-accepts codex MCP tool-approval **elicitations**. The new `@agentclientprotocol/codex-acp` adapter (successor to `zed-industries/codex-acp`) forwards codex MCP tool approvals as ACP `elicitation/create` with an injected "Approval scope" `persist` select whenever the client advertises form elicitation — bypassing `session/request_permission` and therefore the existing auto-approver. Detection keys on `_meta.codex_approval_kind == "mcp_tool_call"`; answers the most persistent scope (`always` → `session` → `once`); unmarked elicitations and forms with extra required fields remain interactive. Unit test covers the adapter wire shape. Published as re-spin tag `enhanced/v1.12.0-pre.2` per §11.4. |
@@ -1119,11 +1309,30 @@ purpose-built, smaller workflow on GitHub-hosted runners.
 | Push of `enhanced/v*` tag     | All build jobs run; **GitHub Release is created** with the artifacts.   |
 | `workflow_dispatch` (manual)  | Same as branch push; choose `release` or `dev` profile. No release.     |
 
+Mirroring upstream release tags (§4.5) also fires **upstream's own**
+`.github/workflows/release.yml` in the fork, once per tag. Those runs need
+Namespace runners and secrets the fork lacks, so they sit `queued` forever and
+clutter the Actions list. `gh run cancel` does not remove a run that never
+obtained a runner; use the force-cancel endpoint instead (observed 2026-09-14,
+18 runs):
+
+```bash
+for ID in $($GH gh run list --repo laris/zed-yolo --limit 40 \
+    --json databaseId,workflowName,status \
+    --jq '.[] | select(.workflowName == "release" and .status != "completed") | .databaseId'); do
+  $GH gh api -X POST "repos/laris/zed-yolo/actions/runs/${ID}/force-cancel"
+done
+```
+
+Disabling that workflow in the fork (`$GH gh workflow disable release --repo
+laris/zed-yolo`) would stop the runs at the source; it has not been done
+because it is a repository-settings change outside the Git history.
+
 ### 11.2 Jobs
 
 | Job                                       | Runner          | Builds                                              | Approx time |
 | ----------------------------------------- | --------------- | --------------------------------------------------- | ----------- |
-| `bundle_mac_aarch64`                      | `macos-latest`  | `Zed-Preview.app`, `Zed-aarch64.dmg`, `zed-remote-server-macos-aarch64.gz` | 30–160 min (cache-dependent; ~155 min observed cold after a baseline bump) |
+| `bundle_mac_aarch64`                      | `macos-latest`  | `Zed-Preview.app`, `Zed-aarch64.dmg`, `zed-remote-server-macos-aarch64.gz` | 30–210 min (cache-dependent; ~155 min observed cold after the v1.10 bump, 208 min after the v1.20 bump) |
 | `bundle_linux_remote_server_x86_64`       | `ubuntu-latest` | `zed-remote-server-linux-x86_64.gz` (musl, static)  | 5–15 min    |
 | `bundle_linux_remote_server_aarch64`      | `ubuntu-24.04-arm` | `zed-remote-server-linux-aarch64.gz` (musl, static) | 5–15 min    |
 | `publish_release`                         | `ubuntu-latest` | GitHub Release (tag push only)                      | 1–2 min     |
@@ -1261,6 +1470,11 @@ invariant.
 | The retired CNB repository had no unique Git refs/releases/assets but did have five build logs. | Git parity does not preserve provider-side records. | Inventory and explicitly accept the loss of releases, assets, issues, builds, and logs before deletion. |
 | Documentation-only pushes to `enhanced` run the current build workflow. | Operational notes have real CI cost. | Batch related documentation updates and consider a reviewed `paths-ignore` rule for `MAINTAINING.md`. |
 | The guide once called the modified bundler “unchanged” and treated an attachment variable as a tag trigger. | Operational documentation must be checked against executable files, not only earlier prose. | During each review, grep hard-coded versions/triggers and compare claims with `.cnb.yml`, workflows, and scripts. |
+| Per-object lazy fetches made hydration take longer than the rebase itself, and `git log -G` over an upstream range never finished. | In a `blob:none` clone, object *discovery* is cheap but every content read is a network round trip unless batched. | Hydrate with one `git fetch --stdin` of all missing OIDs (§4.6) before the rebase; never content-search across upstream ranges. |
+| The minidumper "removal criterion" pointed at the wrong crate; a version bump looked like a fix. | Record the exact file and symbol that a workaround exists for, in the crate that actually contains it. | §3.6 names `crash-context/src/mac/ipc.rs`; verify against the lockfile's resolved crate, not the name in the criterion. |
+| The CNB cross-build had compiled for months but its Darwin binaries had never been run; three build scripts silently dropped macOS behaviour on a Linux host. | `cfg!(target_os)` in `build.rs` means the host. A cross-build is only validated by running its output. | Gate on `CARGO_CFG_TARGET_OS` (§3.4) and keep the stage-2 smoke test in §5.4 part of every toolchain change. |
+| zig could not be used on the CentOS 7 build host at any version: ≥ 0.14 needs `statx(2)`, ≤ 0.13 lacks `section$start/end`. | A toolchain pinned to one host kernel is fragile; LLVM's own Mach-O linker plus Apple's compiler-rt slice reproduces Apple's link closely with plain glibc binaries. | §5.4.3 lists every link-time trap and its fix; re-check them when clang/lld or the SDK moves. |
+| A smoke test quit "Zed Preview" by application name from inside a Zed-hosted agent session, killing the session. | Every Zed build shares bundle id, process name and the per-user instance port. | Test binaries by PID with `--system-specs`; window-level tests are the operator's (§5.4.2). |
 
 ### 12.3 Compaction plan (executed 2026-07-05 and 2026-08-07; template for future runs)
 
